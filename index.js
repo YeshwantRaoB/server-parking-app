@@ -22,8 +22,9 @@ cloudinary.config({
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-}).then(() => console.log('MongoDB connected'))
-  .catch((err) => console.error('MongoDB connection error:', err));
+})
+.then(() => console.log('MongoDB connected'))
+.catch((err) => console.error('MongoDB connection error:', err));
 
 // Multer setup for file uploads
 const upload = multer({ dest: 'uploads/' });
@@ -61,24 +62,51 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// Search vehicles by licence plate
+// Search vehicles endpoint supporting pagination and sorting
 app.get('/vehicles', async (req, res) => {
-  const plate = req.query.licencePlate;
-  if (!plate) {
-    return res.status(400).json({ error: 'licencePlate query parameter required' });
-  }
   try {
-    const vehicles = await Vehicle.find({ licencePlate: { $regex: plate, $options: 'i' } });
-    res.json(vehicles);
+    let { licencePlate, page = 1, limit = 10, sortBy = 'licencePlate' } = req.query;
+
+    page = parseInt(page);
+    limit = parseInt(limit);
+
+    const query = {};
+
+    if (licencePlate) {
+      query.licencePlate = { $regex: licencePlate, $options: 'i' }; // case-insensitive regex match
+    }
+
+    // Validate sortBy field - allow only certain fields
+    const allowedSortFields = ['licencePlate', 'fullName', 'branch'];
+    if (!allowedSortFields.includes(sortBy)) {
+      sortBy = 'licencePlate';
+    }
+
+    // Count total records for pagination
+    const totalRecords = await Vehicle.countDocuments(query);
+
+    // Query vehicles with pagination and sorting
+    const vehicles = await Vehicle.find(query)
+      .sort({ [sortBy]: 1 }) // ascending sort
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .exec();
+
+    res.json({
+      page,
+      limit,
+      totalRecords,
+      totalPages: Math.ceil(totalRecords / limit),
+      vehicles
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
 // Simple admin login endpoint
 app.post('/admin/login', (req, res) => {
   const { username, password } = req.body;
-
-  // Replace with real credential check or use database in production
   const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
   const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'password123';
 
@@ -87,6 +115,38 @@ app.post('/admin/login', (req, res) => {
     return res.json({ token: 'dummy-admin-token' });
   }
   return res.status(401).json({ error: 'Invalid credentials' });
+});
+
+// Delete a vehicle by ID
+app.delete('/vehicles/:id', async (req, res) => {
+  try {
+    const deletedVehicle = await Vehicle.findByIdAndDelete(req.params.id);
+    if (!deletedVehicle) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+    res.json({ message: 'Vehicle deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update a vehicle by ID
+app.patch('/vehicles/:id', async (req, res) => {
+  try {
+    const updateData = req.body;
+    const updatedVehicle = await Vehicle.findByIdAndUpdate(req.params.id, updateData, {
+      new: true, // return the updated document
+      runValidators: true, // enforce schema validators
+    });
+
+    if (!updatedVehicle) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    res.json({ message: 'Vehicle updated successfully', vehicle: updatedVehicle });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Start server
