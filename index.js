@@ -83,7 +83,11 @@ const vehicleSchema = new mongoose.Schema({
   fullName: { type: String, required: true },
   branch: { type: String, required: true },
   designation: { type: String, required: true },
-  photoUrl: { type: String, required: true },
+  registerNumber: { type: String }, // For students only
+  department: { type: String }, // For staff only
+  vehicleName: { type: String, required: true }, // Vehicle name/model
+  vehiclePhotoUrl: { type: String, required: true }, // Vehicle photo
+  ownerPhotoUrl: { type: String, required: true }, // Owner photo
   userId: { type: String, required: true }, // Clerk user ID
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
@@ -105,11 +109,30 @@ app.post('/upload-image', requireAuth, upload.single('image'), async (req, res) 
 // Register vehicle endpoint (protected)
 app.post('/register', requireAuth, async (req, res) => {
   try {
-    const { licencePlate, fullName, branch, designation, photoUrl } = req.body;
+    const { 
+      licencePlate, 
+      fullName, 
+      branch, 
+      designation, 
+      registerNumber,
+      department,
+      vehicleName,
+      vehiclePhotoUrl, 
+      ownerPhotoUrl 
+    } = req.body;
     
     // Validate required fields
-    if (!licencePlate || !fullName || !branch || !designation || !photoUrl) {
-      return res.status(400).json({ error: 'All fields are required' });
+    if (!licencePlate || !fullName || !branch || !designation || !vehicleName || !vehiclePhotoUrl || !ownerPhotoUrl) {
+      return res.status(400).json({ error: 'All required fields must be filled' });
+    }
+
+    // Validate conditional fields
+    if (designation === 'Student' && !registerNumber) {
+      return res.status(400).json({ error: 'Register number is required for students' });
+    }
+
+    if (designation === 'Staff' && !department) {
+      return res.status(400).json({ error: 'Department is required for staff' });
     }
 
     // Normalize license plate (uppercase, remove spaces)
@@ -128,8 +151,12 @@ app.post('/register', requireAuth, async (req, res) => {
       licencePlate: normalizedPlate, 
       fullName: fullName.trim(), 
       branch: branch.trim(), 
-      designation: designation.trim(), 
-      photoUrl,
+      designation: designation.trim(),
+      registerNumber: registerNumber?.trim() || null,
+      department: department?.trim() || null,
+      vehicleName: vehicleName.trim(),
+      vehiclePhotoUrl,
+      ownerPhotoUrl,
       userId: req.auth.userId // Link to Clerk user ID
     });
     
