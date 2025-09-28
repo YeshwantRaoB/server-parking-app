@@ -3,15 +3,17 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
-const { ClerkExpressRequireAuth } = require('@clerk/clerk-sdk-node');
+const { ClerkExpressRequireAuth, clerkClient } = require('@clerk/clerk-sdk-node');
 require('dotenv').config();
 
 const app = express();
 
 // Middleware
 app.use(cors({
-  origin: ['http://localhost:19006', 'exp://192.168.1.*:19000'], // Update with your frontend URLs
-  credentials: true
+  origin: true, // Allow all origins for development
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(express.json({ limit: '10mb' }));
 
@@ -28,11 +30,35 @@ const requireAuth = (req, res, next) => {
 // Admin middleware to check if user has admin role
 const requireAdmin = [
   requireAuth,
-  (req, res, next) => {
-    if (req.auth.claims?.metadata?.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin access required' });
+  async (req, res, next) => {
+    try {
+      // Debug: Log the entire auth object to see what's available
+      console.log('Auth userId:', req.auth.userId);
+      console.log('Session claims:', JSON.stringify(req.auth.sessionClaims, null, 2));
+      
+      // Try to get role from session claims first
+      let userRole = req.auth.sessionClaims?.metadata?.role || 
+                     req.auth.sessionClaims?.publicMetadata?.role ||
+                     req.auth.sessionClaims?.public_metadata?.role;
+      
+      // If not found in session claims, fetch from Clerk API
+      if (!userRole) {
+        console.log('Role not found in session claims, fetching from Clerk API...');
+        const user = await clerkClient.users.getUser(req.auth.userId);
+        userRole = user.publicMetadata?.role;
+        console.log('Role from Clerk API:', userRole);
+      }
+      
+      console.log('Final extracted user role:', userRole);
+      
+      if (userRole !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required' });
+      }
+      next();
+    } catch (error) {
+      console.error('Error checking admin role:', error);
+      return res.status(500).json({ error: 'Failed to verify admin role' });
     }
-    next();
   }
 ];
 
@@ -44,10 +70,7 @@ cloudinary.config({
 });
 
 // MongoDB connection
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
+mongoose.connect(process.env.MONGODB_URI)
 .then(() => console.log('MongoDB connected'))
 .catch((err) => console.error('MongoDB connection error:', err));
 
@@ -56,11 +79,14 @@ const upload = multer({ dest: 'uploads/' });
 
 // Vehicle schema and model
 const vehicleSchema = new mongoose.Schema({
-  licencePlate: String,
-  fullName: String,
-  branch: String,
-  designation: String,
-  photoUrl: String,
+  licencePlate: { type: String, required: true, unique: true },
+  fullName: { type: String, required: true },
+  branch: { type: String, required: true },
+  designation: { type: String, required: true },
+  photoUrl: { type: String, required: true },
+  userId: { type: String, required: true }, // Clerk user ID
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
 });
 
 const Vehicle = mongoose.model('Vehicle', vehicleSchema);
@@ -81,17 +107,28 @@ app.post('/register', requireAuth, async (req, res) => {
   try {
     const { licencePlate, fullName, branch, designation, photoUrl } = req.body;
     
+    // Validate required fields
+    if (!licencePlate || !fullName || !branch || !designation || !photoUrl) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    // Normalize license plate (uppercase, remove spaces)
+    const normalizedPlate = licencePlate.toUpperCase().replace(/\s+/g, '');
+    
     // Check if vehicle with this plate already exists
-    const existingVehicle = await Vehicle.findOne({ licencePlate });
+    const existingVehicle = await Vehicle.findOne({ 
+      licencePlate: { $regex: new RegExp(`^${normalizedPlate}$`, 'i') }
+    });
+    
     if (existingVehicle) {
       return res.status(400).json({ error: 'Vehicle with this license plate already registered' });
     }
 
     const vehicle = new Vehicle({ 
-      licencePlate, 
-      fullName, 
-      branch, 
-      designation, 
+      licencePlate: normalizedPlate, 
+      fullName: fullName.trim(), 
+      branch: branch.trim(), 
+      designation: designation.trim(), 
       photoUrl,
       userId: req.auth.userId // Link to Clerk user ID
     });
@@ -100,7 +137,70 @@ app.post('/register', requireAuth, async (req, res) => {
     res.status(201).json({ message: 'Vehicle registered successfully', vehicle });
   } catch (err) {
     console.error('Registration error:', err);
+    if (err.code === 11000) {
+      return res.status(400).json({ error: 'Vehicle with this license plate already registered' });
+    }
     res.status(500).json({ error: 'Failed to register vehicle' });
+  }
+});
+
+// Get user's own vehicles endpoint (protected)
+app.get('/my-vehicles', requireAuth, async (req, res) => {
+  try {
+    const vehicles = await Vehicle.find({ userId: req.auth.userId })
+      .sort({ createdAt: -1 })
+      .lean()
+      .exec();
+
+    res.json({
+      success: true,
+      vehicles
+    });
+  } catch (err) {
+    console.error('Error fetching user vehicles:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch vehicles' });
+  }
+});
+
+// Update user's own vehicle endpoint (protected)
+app.patch('/my-vehicles/:id', requireAuth, async (req, res) => {
+  try {
+    const { licencePlate, ...updateData } = req.body;
+    
+    // Check if vehicle belongs to user
+    const vehicle = await Vehicle.findOne({ _id: req.params.id, userId: req.auth.userId });
+    if (!vehicle) {
+      return res.status(404).json({ error: 'Vehicle not found or access denied' });
+    }
+    
+    // If updating license plate, check for duplicates
+    if (licencePlate && licencePlate !== vehicle.licencePlate) {
+      const existing = await Vehicle.findOne({ licencePlate });
+      if (existing) {
+        return res.status(400).json({ error: 'Another vehicle with this license plate already exists' });
+      }
+      updateData.licencePlate = licencePlate;
+    }
+
+    updateData.updatedAt = new Date();
+
+    const updatedVehicle = await Vehicle.findByIdAndUpdate(
+      req.params.id, 
+      updateData,
+      {
+        new: true,
+        runValidators: true,
+      }
+    );
+
+    res.json({ 
+      success: true, 
+      message: 'Vehicle updated successfully', 
+      vehicle: updatedVehicle 
+    });
+  } catch (error) {
+    console.error('Update error:', error);
+    res.status(500).json({ error: 'Failed to update vehicle' });
   }
 });
 
@@ -156,6 +256,33 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Debug endpoint to check token contents (protected)
+app.get('/debug-token', requireAuth, async (req, res) => {
+  try {
+    // Get user from Clerk API to see current metadata
+    const user = await clerkClient.users.getUser(req.auth.userId);
+    
+    res.json({
+      userId: req.auth.userId,
+      sessionClaims: req.auth.sessionClaims,
+      userFromClerk: {
+        id: user.id,
+        emailAddresses: user.emailAddresses,
+        publicMetadata: user.publicMetadata,
+        privateMetadata: user.privateMetadata,
+      },
+      auth: req.auth,
+    });
+  } catch (error) {
+    res.json({
+      userId: req.auth.userId,
+      sessionClaims: req.auth.sessionClaims,
+      auth: req.auth,
+      error: error.message,
+    });
+  }
+});
+
 // Delete a vehicle by ID (admin only)
 app.delete('/vehicles/:id', requireAdmin, async (req, res) => {
   try {
@@ -167,6 +294,46 @@ app.delete('/vehicles/:id', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Delete error:', error);
     res.status(500).json({ error: 'Failed to delete vehicle' });
+  }
+});
+
+// Add admin endpoint (admin only)
+app.post('/add-admin', requireAdmin, async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    // Find user by email in Clerk
+    const users = await clerkClient.users.getUserList({
+      emailAddress: [email]
+    });
+
+    if (users.length === 0) {
+      return res.status(404).json({ error: 'User not found with this email address' });
+    }
+
+    const user = users[0];
+
+    // Update user's public metadata to include admin role
+    await clerkClient.users.updateUserMetadata(user.id, {
+      publicMetadata: {
+        ...user.publicMetadata,
+        role: 'admin'
+      }
+    });
+
+    console.log(`Admin role granted to user: ${email} (${user.id})`);
+    
+    res.json({ 
+      success: true, 
+      message: `Admin privileges granted to ${email}. They will need to sign out and sign back in for changes to take effect.` 
+    });
+  } catch (error) {
+    console.error('Add admin error:', error);
+    res.status(500).json({ error: 'Failed to add admin: ' + error.message });
   }
 });
 
