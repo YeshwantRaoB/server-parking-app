@@ -278,6 +278,49 @@ app.get('/vehicles', requireAdmin, async (req, res) => {
   }
 });
 
+// License plate lookup endpoint (protected, admin only) - Optimized for scanning
+app.get('/vehicles/lookup/:licensePlate', requireAdmin, async (req, res) => {
+  try {
+    const { licensePlate } = req.params;
+    
+    if (!licensePlate) {
+      return res.status(400).json({ success: false, error: 'License plate is required' });
+    }
+
+    // Normalize the license plate for search (remove spaces, convert to uppercase)
+    const normalizedPlate = licensePlate.toUpperCase().replace(/\s+/g, '');
+    
+    // Search for exact match first, then fuzzy match
+    let vehicle = await Vehicle.findOne({ 
+      licencePlate: normalizedPlate 
+    }).lean().exec();
+
+    // If no exact match, try fuzzy search
+    if (!vehicle) {
+      vehicle = await Vehicle.findOne({ 
+        licencePlate: { $regex: normalizedPlate, $options: 'i' }
+      }).lean().exec();
+    }
+
+    if (vehicle) {
+      res.json({
+        success: true,
+        found: true,
+        vehicle
+      });
+    } else {
+      res.json({
+        success: true,
+        found: false,
+        message: 'Vehicle not found'
+      });
+    }
+  } catch (err) {
+    console.error('License plate lookup error:', err);
+    res.status(500).json({ success: false, error: 'Failed to lookup license plate' });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
