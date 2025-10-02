@@ -407,6 +407,75 @@ app.post('/add-admin', requireAdmin, async (req, res) => {
   }
 });
 
+// Get vehicle statistics endpoint (admin only)
+app.get('/vehicles/stats', requireAdmin, async (req, res) => {
+  try {
+    // Total vehicle count
+    const total = await Vehicle.countDocuments({});
+    
+    // Designation breakdown
+    const designations = await Vehicle.aggregate([
+      { $group: { _id: '$designation', count: { $sum: 1 } } },
+      { $sort: { _id: 1 } } // Sort alphabetically
+    ]);
+    
+    // Student branch breakdown
+    const branches = await Vehicle.aggregate([
+      { $match: { designation: 'Student' } },
+      { $group: { _id: '$branch', count: { $sum: 1 } } },
+      { $sort: { count: -1 } } // Sort by count descending
+    ]);
+    
+    // Staff position breakdown (using department field from backend)
+    const staffPositions = await Vehicle.aggregate([
+      { $match: { designation: 'Staff' } },
+      { $group: { _id: '$department', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ]);
+    
+    // Recent registrations (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const recentCount = await Vehicle.countDocuments({
+      createdAt: { $gte: thirtyDaysAgo }
+    });
+    
+    // Monthly registration trend (last 6 months)
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    
+    const monthlyTrend = await Vehicle.aggregate([
+      { $match: { createdAt: { $gte: sixMonthsAgo } } },
+      {
+        $group: {
+          _id: {
+            year: { $year: '$createdAt' },
+            month: { $month: '$createdAt' }
+          },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1 } }
+    ]);
+
+    res.json({
+      success: true,
+      total,
+      designations: designations.map(d => ({ designation: d._id, count: d.count })),
+      branches: branches.map(b => ({ branch: b._id, count: b.count })),
+      staffPositions: staffPositions.map(s => ({ position: s._id, count: s.count })),
+      recentCount,
+      monthlyTrend: monthlyTrend.map(m => ({
+        month: `${m._id.year}-${String(m._id.month).padStart(2, '0')}`,
+        count: m.count
+      }))
+    });
+  } catch (error) {
+    console.error('Stats error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch statistics' });
+  }
+});
+
 // Update a vehicle by ID (admin only)
 app.patch('/vehicles/:id', requireAdmin, async (req, res) => {
   try {
