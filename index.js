@@ -88,6 +88,17 @@ const vehicleSchema = new mongoose.Schema({
   vehicleName: { type: String, required: true }, // Vehicle name/model
   vehiclePhotoUrl: { type: String, required: true }, // Vehicle photo
   ownerPhotoUrl: { type: String, required: true }, // Owner photo
+  phoneNumber: { 
+    type: String, 
+    required: true,
+    validate: {
+      validator: function(v) {
+        // Indian mobile number validation: starts with 6-9, followed by 9 digits
+        return /^[6-9]\d{9}$/.test(v);
+      },
+      message: 'Phone number must be a valid Indian mobile number (10 digits starting with 6-9)'
+    }
+  }, // Owner phone number
   userId: { type: String, required: true }, // Clerk user ID
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
@@ -118,12 +129,20 @@ app.post('/register', requireAuth, async (req, res) => {
       department,
       vehicleName,
       vehiclePhotoUrl, 
-      ownerPhotoUrl 
+      ownerPhotoUrl,
+      phoneNumber
     } = req.body;
     
     // Validate required fields
-    if (!licencePlate || !fullName || !branch || !designation || !vehicleName || !vehiclePhotoUrl || !ownerPhotoUrl) {
-      return res.status(400).json({ error: 'All required fields must be filled' });
+    if (!licencePlate || !fullName || !branch || !designation || !vehicleName || !vehiclePhotoUrl || !ownerPhotoUrl || !phoneNumber) {
+      return res.status(400).json({ error: 'All required fields must be filled, including phone number' });
+    }
+
+    // Validate phone number format (Indian mobile number)
+    if (!/^[6-9]\d{9}$/.test(phoneNumber)) {
+      return res.status(400).json({ 
+        error: 'Invalid phone number. Please enter a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9' 
+      });
     }
 
     // Validate conditional fields
@@ -157,6 +176,7 @@ app.post('/register', requireAuth, async (req, res) => {
       vehicleName: vehicleName.trim(),
       vehiclePhotoUrl,
       ownerPhotoUrl,
+      phoneNumber: phoneNumber.trim(),
       userId: req.auth.userId // Link to Clerk user ID
     });
     
@@ -192,7 +212,14 @@ app.get('/my-vehicles', requireAuth, async (req, res) => {
 // Update user's own vehicle endpoint (protected)
 app.patch('/my-vehicles/:id', requireAuth, async (req, res) => {
   try {
-    const { licencePlate, ...updateData } = req.body;
+    const { licencePlate, phoneNumber, ...updateData } = req.body;
+
+    // Validate phone number if provided
+    if (phoneNumber && !/^[6-9]\d{9}$/.test(phoneNumber)) {
+      return res.status(400).json({ 
+        error: 'Invalid phone number. Please enter a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9' 
+      });
+    }
     
     // Check if vehicle belongs to user
     const vehicle = await Vehicle.findOne({ _id: req.params.id, userId: req.auth.userId });
@@ -207,6 +234,11 @@ app.patch('/my-vehicles/:id', requireAuth, async (req, res) => {
         return res.status(400).json({ error: 'Another vehicle with this license plate already exists' });
       }
       updateData.licencePlate = licencePlate;
+    }
+
+    // If updating phone number, include it in update data
+    if (phoneNumber) {
+      updateData.phoneNumber = phoneNumber.trim();
     }
 
     updateData.updatedAt = new Date();
@@ -479,7 +511,14 @@ app.get('/vehicles/stats', requireAdmin, async (req, res) => {
 // Update a vehicle by ID (admin only)
 app.patch('/vehicles/:id', requireAdmin, async (req, res) => {
   try {
-    const { licencePlate, ...updateData } = req.body;
+    const { licencePlate, phoneNumber, ...updateData } = req.body;
+
+    // Validate phone number if provided
+    if (phoneNumber && !/^[6-9]\d{9}$/.test(phoneNumber)) {
+      return res.status(400).json({ 
+        error: 'Invalid phone number. Please enter a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9' 
+      });
+    }
     
     // If updating license plate, check for duplicates
     if (licencePlate) {
@@ -492,6 +531,11 @@ app.patch('/vehicles/:id', requireAdmin, async (req, res) => {
         return res.status(400).json({ error: 'Another vehicle with this license plate already exists' });
       }
       updateData.licencePlate = licencePlate;
+    }
+
+    // If updating phone number, include it in update data
+    if (phoneNumber) {
+      updateData.phoneNumber = phoneNumber.trim();
     }
 
     const updatedVehicle = await Vehicle.findByIdAndUpdate(
