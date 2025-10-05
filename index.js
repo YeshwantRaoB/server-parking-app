@@ -69,13 +69,20 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// MongoDB connection
-mongoose.connect(process.env.MONGODB_URI)
-.then(() => console.log('MongoDB connected'))
-.catch((err) => console.error('MongoDB connection error:', err));
+// MongoDB connection function for serverless
+const connectDB = async () => {
+  if (mongoose.connection.readyState >= 1) return;
+  try {
+    await mongoose.connect(process.env.MONGODB_URI);
+    console.log('MongoDB connected');
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    throw err;
+  }
+};
 
-// Multer setup for file uploads
-const upload = multer({ dest: 'uploads/' });
+// Multer setup for file uploads (use /tmp for Vercel)
+const upload = multer({ dest: '/tmp/' });
 
 // Vehicle schema and model
 const vehicleSchema = new mongoose.Schema({
@@ -120,15 +127,16 @@ app.post('/upload-image', requireAuth, upload.single('image'), async (req, res) 
 // Register vehicle endpoint (protected)
 app.post('/register', requireAuth, async (req, res) => {
   try {
-    const { 
-      licencePlate, 
-      fullName, 
-      branch, 
-      designation, 
+    await connectDB();
+    const {
+      licencePlate,
+      fullName,
+      branch,
+      designation,
       registerNumber,
       department,
       vehicleName,
-      vehiclePhotoUrl, 
+      vehiclePhotoUrl,
       ownerPhotoUrl,
       phoneNumber
     } = req.body;
@@ -194,6 +202,7 @@ app.post('/register', requireAuth, async (req, res) => {
 // Get user's own vehicles endpoint (protected)
 app.get('/my-vehicles', requireAuth, async (req, res) => {
   try {
+    await connectDB();
     const vehicles = await Vehicle.find({ userId: req.auth.userId })
       .sort({ createdAt: -1 })
       .lean()
@@ -212,6 +221,7 @@ app.get('/my-vehicles', requireAuth, async (req, res) => {
 // Update user's own vehicle endpoint (protected)
 app.patch('/my-vehicles/:id', requireAuth, async (req, res) => {
   try {
+    await connectDB();
     const { licencePlate, phoneNumber, ...updateData } = req.body;
 
     // Validate phone number if provided
@@ -266,6 +276,7 @@ app.patch('/my-vehicles/:id', requireAuth, async (req, res) => {
 // Search vehicles endpoint (protected, admin only)
 app.get('/vehicles', requireAdmin, async (req, res) => {
   try {
+    await connectDB();
     let { licencePlate, page = 1, limit = 10, sortBy = 'licencePlate' } = req.query;
 
     page = parseInt(page);
@@ -313,6 +324,7 @@ app.get('/vehicles', requireAdmin, async (req, res) => {
 // License plate lookup endpoint (protected, admin only) - Optimized for scanning
 app.get('/vehicles/lookup/:licensePlate', requireAdmin, async (req, res) => {
   try {
+    await connectDB();
     const { licensePlate } = req.params;
     
     if (!licensePlate) {
@@ -388,6 +400,7 @@ app.get('/debug-token', requireAuth, async (req, res) => {
 // Delete a vehicle by ID (admin only)
 app.delete('/vehicles/:id', requireAdmin, async (req, res) => {
   try {
+    await connectDB();
     const deletedVehicle = await Vehicle.findByIdAndDelete(req.params.id);
     if (!deletedVehicle) {
       return res.status(404).json({ error: 'Vehicle not found' });
@@ -402,6 +415,7 @@ app.delete('/vehicles/:id', requireAdmin, async (req, res) => {
 // Add admin endpoint (admin only)
 app.post('/add-admin', requireAdmin, async (req, res) => {
   try {
+    await connectDB();
     const { email } = req.body;
     
     if (!email) {
@@ -442,6 +456,7 @@ app.post('/add-admin', requireAdmin, async (req, res) => {
 // Get vehicle statistics endpoint (admin only)
 app.get('/vehicles/stats', requireAdmin, async (req, res) => {
   try {
+    await connectDB();
     // Total vehicle count
     const total = await Vehicle.countDocuments({});
     
@@ -511,6 +526,7 @@ app.get('/vehicles/stats', requireAdmin, async (req, res) => {
 // Update a vehicle by ID (admin only)
 app.patch('/vehicles/:id', requireAdmin, async (req, res) => {
   try {
+    await connectDB();
     const { licencePlate, phoneNumber, ...updateData } = req.body;
 
     // Validate phone number if provided
@@ -577,30 +593,5 @@ app.use((req, res) => {
   res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
-// Start server
-const PORT = process.env.PORT || 5000;
-const server = app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-});
-
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled Rejection:', err);
-  server.close(() => process.exit(1));
-});
-
-// Handle uncaught exceptions
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
-  server.close(() => process.exit(1));
-});
-
-// Handle graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully');
-  server.close(() => {
-    console.log('Process terminated');
-    process.exit(0);
-  });
-});
+// Export the app for Vercel serverless functions
+module.exports = app;
