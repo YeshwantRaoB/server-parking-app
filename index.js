@@ -4,6 +4,7 @@ const cors = require('cors');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { ClerkExpressRequireAuth, clerkClient } = require('@clerk/clerk-sdk-node');
+const { Expo } = require('expo-server-sdk');
 require('dotenv').config();
 
 const app = express();
@@ -113,6 +114,70 @@ const vehicleSchema = new mongoose.Schema({
 
 const Vehicle = mongoose.model('Vehicle', vehicleSchema);
 
+// User schema for storing push tokens and other user data
+const userSchema = new mongoose.Schema({
+  clerkId: { type: String, required: true, unique: true },
+  pushToken: { type: String },
+  role: { type: String, default: 'user' },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', userSchema);
+
+// Notification helper function
+const sendPushNotification = async (pushToken, title, body, data = {}) => {
+  if (!Expo.isExpoPushToken(pushToken)) {
+    console.error(`Push token ${pushToken} is not a valid Expo push token`);
+    return;
+  }
+
+  const expo = new Expo();
+  const message = {
+    to: pushToken,
+    title,
+    body,
+    data,
+    sound: 'default',
+    priority: 'default',
+  };
+
+  try {
+    const ticket = await expo.sendPushNotificationsAsync([message]);
+    console.log('Notification sent:', ticket);
+    return ticket;
+  } catch (error) {
+    console.error('Error sending notification:', error);
+  }
+};
+
+// Register push token endpoint (protected)
+app.post('/register-push-token', requireAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const { pushToken } = req.body;
+
+    if (!pushToken) {
+      return res.status(400).json({ error: 'Push token is required' });
+    }
+
+    // Upsert user with push token
+    await User.findOneAndUpdate(
+      { clerkId: req.auth.userId },
+      {
+        pushToken,
+        updatedAt: new Date()
+      },
+      { upsert: true, new: true }
+    );
+
+    res.json({ success: true, message: 'Push token registered successfully' });
+  } catch (error) {
+    console.error('Push token registration error:', error);
+    res.status(500).json({ error: 'Failed to register push token' });
+  }
+});
+
 // Upload image endpoint (protected)
 app.post('/upload-image', requireAuth, upload.single('image'), async (req, res) => {
   try {
@@ -189,6 +254,28 @@ app.post('/register', requireAuth, async (req, res) => {
     });
     
     await vehicle.save();
+
+    // Send notifications to all admins
+    try {
+      const admins = await User.find({ role: 'admin' });
+      const notificationPromises = admins
+        .filter(admin => admin.pushToken)
+        .map(admin =>
+          sendPushNotification(
+            admin.pushToken,
+            'New Vehicle Registered',
+            `${vehicle.fullName} registered vehicle ${vehicle.licencePlate}`,
+            { type: 'vehicle_registered', vehicleId: vehicle._id }
+          )
+        );
+
+      await Promise.all(notificationPromises);
+      console.log(`Sent notifications to ${notificationPromises.length} admins`);
+    } catch (notificationError) {
+      console.error('Error sending notifications:', notificationError);
+      // Don't fail the registration if notifications fail
+    }
+
     res.status(201).json({ message: 'Vehicle registered successfully', vehicle });
   } catch (err) {
     console.error('Registration error:', err);
@@ -441,11 +528,18 @@ app.post('/add-admin', requireAdmin, async (req, res) => {
       }
     });
 
+    // Also update our local User model
+    await User.findOneAndUpdate(
+      { clerkId: user.id },
+      { role: 'admin', updatedAt: new Date() },
+      { upsert: true }
+    );
+
     console.log(`Admin role granted to user: ${email} (${user.id})`);
-    
-    res.json({ 
-      success: true, 
-      message: `Admin privileges granted to ${email}. They will need to sign out and sign back in for changes to take effect.` 
+
+    res.json({
+      success: true,
+      message: `Admin privileges granted to ${email}. They will need to sign out and sign back in for changes to take effect.`
     });
   } catch (error) {
     console.error('Add admin error:', error);
