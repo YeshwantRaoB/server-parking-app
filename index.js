@@ -244,13 +244,30 @@ app.post('/upload-image', requireAuth, upload.single('image'), async (req, res) 
 
 // Register vehicle endpoint (protected)
 app.post('/register', requireAuth, async (req, res) => {
+  console.log('\n=== New Registration Request ===');
+  console.log('Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('Auth:', JSON.stringify(req.auth || {}, null, 2));
+  
   try {
-    console.log('Registration request received');
-    console.log('Request headers:', req.headers);
     console.log('Request body:', JSON.stringify(req.body, null, 2));
-    console.log('Auth userId:', req.auth?.userId);
+    
+    // Validate required fields
+    const requiredFields = [
+      'licencePlate', 'fullName', 'branch', 'designation', 
+      'vehicleName', 'vehiclePhotoUrl', 'ownerPhotoUrl', 'phoneNumber'
+    ];
+    
+    const missingFields = requiredFields.filter(field => !req.body[field]);
+    if (missingFields.length > 0) {
+      const errorMsg = `Missing required fields: ${missingFields.join(', ')}`;
+      console.error('Validation error:', errorMsg);
+      return res.status(400).json({ 
+        success: false,
+        error: errorMsg,
+        missingFields
+      });
+    }
 
-    await connectDB();
     const {
       licencePlate,
       fullName,
@@ -258,90 +275,192 @@ app.post('/register', requireAuth, async (req, res) => {
       designation,
       registerNumber,
       department,
+      staffPosition,
       vehicleName,
       vehiclePhotoUrl,
       ownerPhotoUrl,
-      phoneNumber
+      phoneNumber,
+      userId = req.auth?.userId // Fallback to auth userId if not in body
     } = req.body;
-    
-    // Validate required fields
-    if (!licencePlate || !fullName || !branch || !designation || !vehicleName || !vehiclePhotoUrl || !ownerPhotoUrl || !phoneNumber) {
-      return res.status(400).json({ error: 'All required fields must be filled, including phone number' });
-    }
 
     // Validate phone number format (Indian mobile number)
     if (!/^[6-9]\d{9}$/.test(phoneNumber)) {
+      const errorMsg = 'Invalid phone number. Please enter a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9';
+      console.error('Validation error:', errorMsg);
       return res.status(400).json({ 
-        error: 'Invalid phone number. Please enter a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9' 
+        success: false,
+        error: errorMsg
       });
     }
 
     // Validate conditional fields
     if (designation === 'Student' && !registerNumber) {
-      return res.status(400).json({ error: 'Register number is required for students' });
+      const errorMsg = 'Register number is required for students';
+      console.error('Validation error:', errorMsg);
+      return res.status(400).json({ 
+        success: false,
+        error: errorMsg
+      });
     }
 
-    if (designation === 'Staff' && !department) {
-      return res.status(400).json({ error: 'Department is required for staff' });
+    const staffDept = department || staffPosition; // Handle both department and staffPosition
+    if (designation === 'Staff' && !staffDept) {
+      const errorMsg = 'Department/Position is required for staff';
+      console.error('Validation error:', errorMsg);
+      return res.status(400).json({ 
+        success: false,
+        error: errorMsg
+      });
     }
 
     // Normalize license plate (uppercase, remove spaces)
     const normalizedPlate = licencePlate.toUpperCase().replace(/\s+/g, '');
     
+    console.log('Connecting to database...');
+    await connectDB();
+    
     // Check if vehicle with this plate already exists
+    console.log('Checking for existing vehicle with plate:', normalizedPlate);
     const existingVehicle = await Vehicle.findOne({ 
       licencePlate: { $regex: new RegExp(`^${normalizedPlate}$`, 'i') }
     });
     
     if (existingVehicle) {
-      return res.status(400).json({ error: 'Vehicle with this license plate already registered' });
+      const errorMsg = 'Vehicle with this license plate already registered';
+      console.error('Validation error:', errorMsg);
+      return res.status(400).json({ 
+        success: false,
+        error: errorMsg
+      });
     }
 
-    const vehicle = new Vehicle({ 
-      licencePlate: normalizedPlate, 
-      fullName: fullName.trim(), 
-      branch: branch.trim(), 
-      designation: designation.trim(),
-      registerNumber: registerNumber?.trim() || null,
-      department: department?.trim() || null,
-      vehicleName: vehicleName.trim(),
-      vehiclePhotoUrl,
-      ownerPhotoUrl,
-      phoneNumber: phoneNumber.trim(),
-      userId: req.auth.userId // Link to Clerk user ID
+    console.log('Creating new vehicle record...');
+
+    try {
+      const vehicleData = {
+        licencePlate: normalizedPlate, 
+        fullName: fullName.trim(), 
+        branch: branch.trim(), 
+        designation: designation.trim(),
+        registerNumber: designation === 'Student' ? registerNumber?.trim() : null,
+        department: staffDept?.trim() || null,
+        vehicleName: vehicleName.trim(),
+        vehiclePhotoUrl,
+        ownerPhotoUrl,
+        phoneNumber: phoneNumber.trim(),
+        userId
+      };
+
+      console.log('Vehicle data to save:', JSON.stringify(vehicleData, null, 2));
+      
+      const vehicle = new Vehicle(vehicleData);
+      const savedVehicle = await vehicle.save();
+      console.log('Vehicle saved successfully:', savedVehicle);
+
+      // Send push notification to admins
+      try {
+        console.log('Sending notifications to admins...');
+        const admins = await User.find({ isAdmin: true });
+        console.log(`Found ${admins.length} admins to notify`);
+        
+        const notificationPromises = admins.map(admin => {
+          if (admin.pushToken) {
+            console.log(`Sending notification to admin: ${admin._id}`);
+            return sendPushNotification(
+              admin.pushToken,
+              'New Vehicle Registered',
+              `Vehicle ${normalizedPlate} registered by ${fullName}`,
+              { 
+                screen: 'Admin',
+                vehicleId: savedVehicle._id
+              }
+            ).catch(e => {
+              console.error(`Failed to send notification to admin ${admin._id}:`, e);
+              return null;
+            });
+          }
+          return Promise.resolve();
+        });
+
+        await Promise.all(notificationPromises);
+        console.log('All notifications sent');
+      } catch (notificationError) {
+        console.error('Error in notification process:', notificationError);
+        // Don't fail the request if notifications fail
+      }
+
+      console.log('Vehicle registration completed successfully');
+      return res.status(201).json({ 
+        success: true, 
+        message: 'Vehicle registered successfully',
+        vehicle: savedVehicle,
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('Error saving vehicle:', {
+        message: error.message,
+        stack: error.stack,
+        name: error.name,
+        ...(error.code && { code: error.code }),
+        ...(error.keyPattern && { keyPattern: error.keyPattern }),
+        ...(error.keyValue && { keyValue: error.keyValue })
+      });
+      
+      // Handle duplicate key errors
+      if (error.code === 11000) {
+        const field = Object.keys(error.keyPattern)[0];
+        const value = error.keyValue[field];
+        return res.status(409).json({
+          success: false,
+          error: `${field} '${value}' is already registered`,
+          field,
+          value,
+          code: 'DUPLICATE_KEY'
+        });
+      }
+      
+      // Handle validation errors
+      if (error.name === 'ValidationError') {
+        const errors = Object.values(error.errors).map(err => ({
+          field: err.path,
+          message: err.message,
+          type: err.kind
+        }));
+        
+        return res.status(400).json({
+          success: false,
+          error: 'Validation failed',
+          details: errors,
+          code: 'VALIDATION_ERROR'
+        });
+      }
+      
+      // Generic error response
+      return res.status(500).json({ 
+        success: false,
+        error: 'Internal server error during registration',
+        message: process.env.NODE_ENV === 'production' 
+          ? 'An error occurred while processing your request' 
+          : error.message,
+        code: 'INTERNAL_SERVER_ERROR',
+        ...(process.env.NODE_ENV !== 'production' && { stack: error.stack })
+      });
+    }
+  } catch (error) {
+    console.error('Registration error:', {
+      message: error.message,
+      stack: error.stack,
+      name: error.name,
+      ...(error.code && { code: error.code })
     });
     
-    await vehicle.save();
-
-    // Send notifications to all admins
-    try {
-      const admins = await User.find({ role: 'admin' });
-      const notificationPromises = admins
-        .filter(admin => admin.pushToken)
-        .map(admin =>
-          sendPushNotification(
-            admin.pushToken,
-            'New Vehicle Registered',
-            `${vehicle.fullName} registered vehicle ${vehicle.licencePlate}`,
-            { type: 'vehicle_registered', vehicleId: vehicle._id }
-          )
-        );
-
-      await Promise.all(notificationPromises);
-      console.log(`Sent notifications to ${notificationPromises.length} admins`);
-    } catch (notificationError) {
-      console.error('Error sending notifications:', notificationError);
-      // Don't fail the registration if notifications fail
-    }
-
-    console.log('Vehicle registered successfully:', vehicle._id);
-    res.status(201).json({ message: 'Vehicle registered successfully', vehicle });
-  } catch (err) {
-    console.error('Registration error:', err);
-    if (err.code === 11000) {
-      return res.status(400).json({ error: 'Vehicle with this license plate already registered' });
-    }
-    res.status(500).json({ error: 'Failed to register vehicle: ' + err.message });
+    res.status(500).json({
+      success: false,
+      error: 'An unexpected error occurred',
+      message: error.message,
+      code: 'INTERNAL_SERVER_ERROR',
+      ...(process.env.NODE_ENV !== 'production' && { stack: error.stack })
+    });
   }
 });
 
