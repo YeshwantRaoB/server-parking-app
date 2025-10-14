@@ -6,7 +6,7 @@ const cloudinary = require('cloudinary').v2;
 const { ClerkExpressRequireAuth, clerkClient } = require('@clerk/clerk-sdk-node');
 const { Expo } = require('expo-server-sdk');
 require('dotenv').config();
-
+//using express
 const app = express();
 
 // Middleware
