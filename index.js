@@ -9,13 +9,36 @@ require('dotenv').config();
 //using express
 const app = express();
 
-// Middleware
-app.use(cors({
-  origin: true, // Allow all origins for development
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-}));
+// CORS Configuration
+const allowedOrigins = [
+  'http://localhost:19006', // Expo development
+  'http://localhost:3000',  // Local development
+  'https://college-parking-app.vercel.app', // Your Vercel frontend URL
+  /.*\.vercel\.app$/, // Allow all Vercel preview deployments
+];
+
+// CORS middleware
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (allowedOrigins.some(allowedOrigin => 
+    typeof allowedOrigin === 'string' 
+      ? origin === allowedOrigin 
+      : allowedOrigin.test(origin)
+  )) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
+    
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+  }
+  next();
+});
+
+// Body parser middleware
 app.use(express.json({ limit: '10mb' }));
 
 // Clerk middleware to verify JWT tokens
