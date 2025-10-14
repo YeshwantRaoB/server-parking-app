@@ -83,7 +83,20 @@ const connectDB = async () => {
 };
 
 // Multer setup for file uploads (use /tmp for Vercel)
-const upload = multer({ dest: '/tmp/' });
+const upload = multer({
+  dest: '/tmp/',
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Allow only image files
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'));
+    }
+  }
+});
 
 // Vehicle schema and model
 const vehicleSchema = new mongoose.Schema({
@@ -181,17 +194,33 @@ app.post('/register-push-token', requireAuth, async (req, res) => {
 // Upload image endpoint (protected)
 app.post('/upload-image', requireAuth, upload.single('image'), async (req, res) => {
   try {
-    const result = await cloudinary.uploader.upload(req.file.path);
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image file provided' });
+    }
+
+    console.log('Uploading image to Cloudinary:', req.file.path);
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      folder: 'parking-app',
+      resource_type: 'image',
+      quality: 'auto',
+      format: 'jpg'
+    });
+
+    console.log('Cloudinary upload successful:', result.secure_url);
     res.json({ url: result.secure_url });
   } catch (error) {
     console.error('Upload error:', error);
-    res.status(500).json({ error: 'Failed to upload image' });
+    res.status(500).json({ error: 'Failed to upload image: ' + error.message });
   }
 });
 
 // Register vehicle endpoint (protected)
 app.post('/register', requireAuth, async (req, res) => {
   try {
+    console.log('Registration request received');
+    console.log('Request body:', JSON.stringify(req.body, null, 2));
+    console.log('Auth userId:', req.auth?.userId);
+
     await connectDB();
     const {
       licencePlate,
@@ -276,13 +305,14 @@ app.post('/register', requireAuth, async (req, res) => {
       // Don't fail the registration if notifications fail
     }
 
+    console.log('Vehicle registered successfully:', vehicle._id);
     res.status(201).json({ message: 'Vehicle registered successfully', vehicle });
   } catch (err) {
     console.error('Registration error:', err);
     if (err.code === 11000) {
       return res.status(400).json({ error: 'Vehicle with this license plate already registered' });
     }
-    res.status(500).json({ error: 'Failed to register vehicle' });
+    res.status(500).json({ error: 'Failed to register vehicle: ' + err.message });
   }
 });
 
