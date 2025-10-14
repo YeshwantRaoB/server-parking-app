@@ -14,7 +14,7 @@ app.use(cors({
   origin: true, // Allow all origins for development
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
 }));
 app.use(express.json({ limit: '10mb' }));
 
@@ -194,7 +194,12 @@ app.post('/register-push-token', requireAuth, async (req, res) => {
 // Upload image endpoint (protected)
 app.post('/upload-image', requireAuth, upload.single('image'), async (req, res) => {
   try {
+    console.log('Upload request received');
+    console.log('Request headers:', req.headers);
+    console.log('File received:', req.file ? 'Yes' : 'No');
+
     if (!req.file) {
+      console.log('No file in request');
       return res.status(400).json({ error: 'No image file provided' });
     }
 
@@ -218,6 +223,7 @@ app.post('/upload-image', requireAuth, upload.single('image'), async (req, res) 
 app.post('/register', requireAuth, async (req, res) => {
   try {
     console.log('Registration request received');
+    console.log('Request headers:', req.headers);
     console.log('Request body:', JSON.stringify(req.body, null, 2));
     console.log('Auth userId:', req.auth?.userId);
 
