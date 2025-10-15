@@ -590,6 +590,148 @@ app.get('/vehicles', requireAdmin, async (req, res) => {
   }
 });
 
+// License plate scanning endpoint with Plate Recognizer API (protected, admin only)
+app.post('/scan-plate', requireAdmin, upload.single('image'), async (req, res) => {
+  try {
+    console.log('Plate scanning request received');
+    
+    if (!req.file) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'No image file provided' 
+      });
+    }
+
+    // Prepare form data for Plate Recognizer API
+    const FormData = require('form-data');
+    const fs = require('fs');
+    const https = require('https');
+    
+    const formData = new FormData();
+    formData.append('upload', fs.createReadStream(req.file.path));
+    // Optionally add regions for better accuracy (e.g., 'in' for India)
+    formData.append('regions', 'in'); // Change based on your region
+    
+    console.log('Sending image to Plate Recognizer API...');
+    
+    // Make request to Plate Recognizer API
+    const options = {
+      method: 'POST',
+      hostname: 'api.platerecognizer.com',
+      path: '/v1/plate-reader/',
+      headers: {
+        'Authorization': 'Token 9836f8ce1925afcbbb121dc58280a9bd4b8a6174',
+        ...formData.getHeaders()
+      }
+    };
+
+    const apiRequest = new Promise((resolve, reject) => {
+      const apiReq = https.request(options, (apiRes) => {
+        let data = '';
+        
+        apiRes.on('data', (chunk) => {
+          data += chunk;
+        });
+        
+        apiRes.on('end', () => {
+          try {
+            const parsedData = JSON.parse(data);
+            resolve(parsedData);
+          } catch (e) {
+            reject(new Error('Failed to parse API response'));
+          }
+        });
+      });
+      
+      apiReq.on('error', (error) => {
+        reject(error);
+      });
+      
+      formData.pipe(apiReq);
+    });
+
+    const plateData = await apiRequest;
+    console.log('Plate Recognizer response:', JSON.stringify(plateData, null, 2));
+
+    // Clean up the uploaded file
+    try {
+      fs.unlinkSync(req.file.path);
+    } catch (cleanupError) {
+      console.error('Error cleaning up file:', cleanupError);
+    }
+
+    // Check if any plates were detected
+    if (!plateData.results || plateData.results.length === 0) {
+      return res.json({
+        success: true,
+        found: false,
+        message: 'No license plate detected in the image',
+        plateDetected: false
+      });
+    }
+
+    // Get the best plate match
+    const detectedPlate = plateData.results[0].plate.toUpperCase().replace(/\s+/g, '');
+    console.log('Detected plate:', detectedPlate);
+
+    // Search database for the detected plate
+    await connectDB();
+    
+    // Try exact match first
+    let vehicle = await Vehicle.findOne({ 
+      licencePlate: detectedPlate 
+    }).lean().exec();
+
+    // If no exact match, try fuzzy search
+    if (!vehicle) {
+      vehicle = await Vehicle.findOne({ 
+        licencePlate: { $regex: detectedPlate, $options: 'i' }
+      }).lean().exec();
+    }
+
+    if (vehicle) {
+      console.log('Vehicle found in database');
+      return res.json({
+        success: true,
+        found: true,
+        plateDetected: true,
+        detectedPlate: detectedPlate,
+        confidence: plateData.results[0].score,
+        vehicle
+      });
+    } else {
+      console.log('Vehicle not found in database');
+      return res.json({
+        success: true,
+        found: false,
+        plateDetected: true,
+        detectedPlate: detectedPlate,
+        confidence: plateData.results[0].score,
+        message: 'Vehicle not registered in the system'
+      });
+    }
+
+  } catch (error) {
+    console.error('Plate scanning error:', error);
+    
+    // Clean up file if it exists
+    if (req.file && req.file.path) {
+      try {
+        const fs = require('fs');
+        fs.unlinkSync(req.file.path);
+      } catch (cleanupError) {
+        console.error('Error cleaning up file:', cleanupError);
+      }
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to scan license plate',
+      message: error.message 
+    });
+  }
+});
+
 // License plate lookup endpoint (protected, admin only) - Optimized for scanning
 app.get('/vehicles/lookup/:licensePlate', requireAdmin, async (req, res) => {
   try {
