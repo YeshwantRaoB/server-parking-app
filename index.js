@@ -593,14 +593,22 @@ app.get('/vehicles', requireAdmin, async (req, res) => {
 // License plate scanning endpoint with Plate Recognizer API (protected)
 app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) => {
   try {
-    console.log('Plate scanning request received');
+    console.log('\n=== Plate Scanning Request ===');
+    console.log('File received:', req.file ? 'Yes' : 'No');
     
     if (!req.file) {
       return res.status(400).json({ 
         success: false, 
-        error: 'No image file provided' 
+        error: 'No image file provided',
+        plateDetected: false
       });
     }
+
+    console.log('File details:', {
+      filename: req.file.filename,
+      size: req.file.size,
+      mimetype: req.file.mimetype
+    });
 
     // Prepare form data for Plate Recognizer API
     const FormData = require('form-data');
@@ -609,10 +617,17 @@ app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) =>
     
     const formData = new FormData();
     formData.append('upload', fs.createReadStream(req.file.path));
-    // Optionally add regions for better accuracy (e.g., 'in' for India)
-    formData.append('regions', 'in'); // Change based on your region
     
-    console.log('Sending image to Plate Recognizer API...');
+    // Add regions for better accuracy - India uses 'in'
+    formData.append('regions', 'in');
+    
+    // Add configuration for better detection
+    formData.append('config', JSON.stringify({
+      region: 'strict',  // Only return results matching the specified region
+      mode: 'fast'       // Use fast mode for quicker results
+    }));
+    
+    console.log('Sending image to Plate Recognizer API with region: in');
     
     // Make request to Plate Recognizer API
     const options = {
@@ -629,6 +644,8 @@ app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) =>
       const apiReq = https.request(options, (apiRes) => {
         let data = '';
         
+        console.log('Plate Recognizer API status:', apiRes.statusCode);
+        
         apiRes.on('data', (chunk) => {
           data += chunk;
         });
@@ -636,14 +653,22 @@ app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) =>
         apiRes.on('end', () => {
           try {
             const parsedData = JSON.parse(data);
-            resolve(parsedData);
+            
+            // Check for API errors
+            if (apiRes.statusCode !== 200 && apiRes.statusCode !== 201) {
+              reject(new Error(parsedData.error || `API returned status ${apiRes.statusCode}`));
+            } else {
+              resolve(parsedData);
+            }
           } catch (e) {
+            console.error('Failed to parse API response:', data);
             reject(new Error('Failed to parse API response'));
           }
         });
       });
       
       apiReq.on('error', (error) => {
+        console.error('HTTPS request error:', error);
         reject(error);
       });
       
@@ -651,7 +676,7 @@ app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) =>
     });
 
     const plateData = await apiRequest;
-    console.log('Plate Recognizer response:', JSON.stringify(plateData, null, 2));
+    console.log('Plate Recognizer full response:', JSON.stringify(plateData, null, 2));
 
     // Clean up the uploaded file
     try {
@@ -662,51 +687,111 @@ app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) =>
 
     // Check if any plates were detected
     if (!plateData.results || plateData.results.length === 0) {
+      console.log('No plates detected in image');
       return res.json({
         success: true,
         found: false,
-        message: 'No license plate detected in the image',
-        plateDetected: false
+        message: 'No license plate detected in the image. Please ensure the plate is clearly visible and try again.',
+        plateDetected: false,
+        apiResponse: {
+          processing_time: plateData.processing_time,
+          filename: plateData.filename
+        }
       });
     }
 
-    // Get the best plate match
-    const detectedPlate = plateData.results[0].plate.toUpperCase().replace(/\s+/g, '');
-    console.log('Detected plate:', detectedPlate);
+    // Get the best plate match (highest confidence score)
+    const bestResult = plateData.results[0];
+    console.log('Best plate result:', bestResult);
+    
+    // Extract plate text - handle both old and new API response formats
+    let plateText = '';
+    if (typeof bestResult.plate === 'string') {
+      plateText = bestResult.plate;
+    } else if (bestResult.plate && bestResult.plate.props && bestResult.plate.props.plate) {
+      plateText = bestResult.plate.props.plate[0].value;
+    }
+    
+    if (!plateText) {
+      console.error('Could not extract plate text from result:', bestResult);
+      return res.json({
+        success: true,
+        found: false,
+        message: 'Plate detection failed. Please try again.',
+        plateDetected: false
+      });
+    }
+    
+    const detectedPlate = plateText.toUpperCase().replace(/\s+/g, '');
+    const confidence = bestResult.score || (bestResult.plate && bestResult.plate.score) || 0;
+    
+    console.log('Detected plate:', detectedPlate, 'Confidence:', confidence);
+
+    // Check confidence threshold (Plate Recognizer recommends 0.7 for high confidence)
+    if (confidence < 0.5) {
+      console.log('Low confidence detection:', confidence);
+      return res.json({
+        success: true,
+        found: false,
+        plateDetected: true,
+        detectedPlate: detectedPlate,
+        confidence: confidence,
+        message: `Low confidence detection (${Math.round(confidence * 100)}%). Please try again with better lighting and angle.`
+      });
+    }
 
     // Search database for the detected plate
     await connectDB();
     
-    // Try exact match first
+    console.log('Searching database for plate:', detectedPlate);
+    
+    // Try exact match first (case-insensitive)
     let vehicle = await Vehicle.findOne({ 
-      licencePlate: detectedPlate 
+      licencePlate: { $regex: new RegExp(`^${detectedPlate}$`, 'i') }
     }).lean().exec();
 
-    // If no exact match, try fuzzy search
+    // If no exact match, try fuzzy search (similar plates)
     if (!vehicle) {
-      vehicle = await Vehicle.findOne({ 
-        licencePlate: { $regex: detectedPlate, $options: 'i' }
-      }).lean().exec();
+      console.log('No exact match, trying fuzzy search...');
+      const allVehicles = await Vehicle.find().lean().exec();
+      
+      // Try to find a close match
+      for (const v of allVehicles) {
+        const storedPlate = v.licencePlate.toUpperCase().replace(/\s+/g, '');
+        
+        // Check if plates are similar (allowing for 1-2 character differences)
+        if (storedPlate.includes(detectedPlate) || detectedPlate.includes(storedPlate)) {
+          vehicle = v;
+          console.log('Found similar plate:', storedPlate, 'for detected:', detectedPlate);
+          break;
+        }
+      }
     }
 
     if (vehicle) {
-      console.log('Vehicle found in database');
+      console.log('Vehicle found in database:', vehicle.licencePlate);
       return res.json({
         success: true,
         found: true,
         plateDetected: true,
         detectedPlate: detectedPlate,
-        confidence: plateData.results[0].score,
-        vehicle
+        confidence: confidence,
+        vehicle,
+        matchType: vehicle.licencePlate.toUpperCase().replace(/\s+/g, '') === detectedPlate ? 'exact' : 'fuzzy'
       });
     } else {
       console.log('Vehicle not found in database');
+      console.log('Detected plate:', detectedPlate);
+      console.log('Available plates in database:');
+      const allPlates = await Vehicle.find().select('licencePlate').lean().exec();
+      console.log(allPlates.map(v => v.licencePlate).join(', '));
+      
       return res.json({
         success: true,
         found: false,
         plateDetected: true,
         detectedPlate: detectedPlate,
-        confidence: plateData.results[0].score,
+        confidence: confidence,
         message: 'Vehicle not registered in the system'
       });
     }
