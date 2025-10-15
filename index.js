@@ -5,6 +5,7 @@ const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { ClerkExpressRequireAuth, clerkClient } = require('@clerk/clerk-sdk-node');
 const { Expo } = require('expo-server-sdk');
+const XLSX = require('xlsx');
 require('dotenv').config();
 //using express
 const app = express();
@@ -90,6 +91,63 @@ const requireAdmin = [
   }
 ];
 
+// Whitelist check middleware - Verify email is authorized for KPT Mangalore
+const checkWhitelist = async (req, res, next) => {
+  try {
+    await connectDB();
+    
+    // Get user's email from Clerk
+    const user = await clerkClient.users.getUser(req.auth.userId);
+    const userEmail = user.emailAddresses[0]?.emailAddress;
+    
+    if (!userEmail) {
+      return res.status(403).json({ 
+        error: 'No email found for user',
+        kptError: true,
+        message: 'This user is not part of KPT Mangalore. Please contact the admin.'
+      });
+    }
+    
+    console.log('Checking whitelist for email:', userEmail);
+    
+    // Check if email is in whitelist
+    const whitelistEntry = await Whitelist.findOne({ 
+      email: userEmail.toLowerCase() 
+    });
+    
+    if (!whitelistEntry) {
+      console.log('Email not in whitelist:', userEmail);
+      return res.status(403).json({ 
+        error: 'Unauthorized access',
+        kptError: true,
+        message: 'This user is not part of KPT Mangalore. Please contact the admin to get your email added to the authorized list.'
+      });
+    }
+    
+    // Update status to registered if it was pending
+    if (whitelistEntry.status === 'pending' && !whitelistEntry.clerkId) {
+      whitelistEntry.status = 'registered';
+      whitelistEntry.clerkId = req.auth.userId;
+      await whitelistEntry.save();
+      console.log('Updated whitelist entry status to registered');
+    }
+    
+    // Store whitelist info in request for later use
+    req.whitelist = whitelistEntry;
+    
+    next();
+  } catch (error) {
+    console.error('Whitelist check error:', error);
+    return res.status(500).json({ 
+      error: 'Failed to verify authorization',
+      message: 'An error occurred while checking authorization. Please try again.'
+    });
+  }
+};
+
+// Combined auth middleware: requireAuth + whitelist check
+const requireAuthWithWhitelist = [requireAuth, checkWhitelist];
+
 // Configure Cloudinary
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -168,6 +226,45 @@ const userSchema = new mongoose.Schema({
 });
 
 const User = mongoose.model('User', userSchema);
+
+// Email Whitelist Schema for managing authorized users
+const whitelistSchema = new mongoose.Schema({
+  email: { 
+    type: String, 
+    required: true, 
+    unique: true,
+    lowercase: true,
+    trim: true,
+    validate: {
+      validator: function(v) {
+        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+      },
+      message: 'Please provide a valid email address'
+    }
+  },
+  userType: { 
+    type: String, 
+    enum: ['Student', 'Staff'], 
+    required: true 
+  },
+  branch: { type: String }, // For students
+  department: { type: String }, // For staff
+  addedBy: { type: String, required: true }, // Clerk ID of admin who added
+  status: { 
+    type: String, 
+    enum: ['pending', 'registered', 'rejected'], 
+    default: 'pending' 
+  },
+  clerkId: { type: String }, // Set when user actually signs up
+  notes: { type: String },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+// Create index for faster lookups
+whitelistSchema.index({ email: 1, status: 1 });
+
+const Whitelist = mongoose.model('Whitelist', whitelistSchema);
 
 // Notification helper function
 const sendPushNotification = async (pushToken, title, body, data = {}) => {
@@ -250,8 +347,8 @@ app.post('/upload-image', requireAuth, upload.single('image'), async (req, res) 
   }
 });
 
-// Register vehicle endpoint (protected)
-app.post('/register', requireAuth, async (req, res) => {
+// Register vehicle endpoint (protected with whitelist check)
+app.post('/register', requireAuthWithWhitelist, async (req, res) => {
   console.log('\n=== New Registration Request ===');
   console.log('Headers:', JSON.stringify(req.headers, null, 2));
   console.log('Auth:', JSON.stringify(req.auth || {}, null, 2));
@@ -480,8 +577,8 @@ app.post('/register', requireAuth, async (req, res) => {
   }
 });
 
-// Get user's own vehicles endpoint (protected)
-app.get('/my-vehicles', requireAuth, async (req, res) => {
+// Get user's own vehicles endpoint (protected with whitelist check)
+app.get('/my-vehicles', requireAuthWithWhitelist, async (req, res) => {
   try {
     await connectDB();
     const vehicles = await Vehicle.find({ userId: req.auth.userId })
@@ -499,8 +596,8 @@ app.get('/my-vehicles', requireAuth, async (req, res) => {
   }
 });
 
-// Update user's own vehicle endpoint (protected)
-app.patch('/my-vehicles/:id', requireAuth, async (req, res) => {
+// Update user's own vehicle endpoint (protected with whitelist check)
+app.patch('/my-vehicles/:id', requireAuthWithWhitelist, async (req, res) => {
   try {
     await connectDB();
     const { licencePlate, phoneNumber, ...updateData } = req.body;
@@ -1124,10 +1221,302 @@ app.post('/test-post', (req, res) => {
   });
 });
 
+// =============================================
+// WHITELIST MANAGEMENT ENDPOINTS
+// =============================================
+
+// Add single email to whitelist (admin only)
+app.post('/whitelist/add', requireAdmin, async (req, res) => {
+  try {
+    await connectDB();
+    const { email, userType, branch, department, notes } = req.body;
+    
+    // Validation
+    if (!email || !userType) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Email and userType are required' 
+      });
+    }
+    
+    const normalizedEmail = email.toLowerCase().trim();
+    
+    // Check if already exists
+    const existing = await Whitelist.findOne({ email: normalizedEmail });
+    if (existing) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Email already exists in whitelist' 
+      });
+    }
+    
+    // Create whitelist entry
+    const whitelistEntry = new Whitelist({
+      email: normalizedEmail,
+      userType,
+      branch: userType === 'Student' ? branch : undefined,
+      department: userType === 'Staff' ? department : undefined,
+      addedBy: req.auth.userId,
+      notes
+    });
+    
+    await whitelistEntry.save();
+    
+    res.json({
+      success: true,
+      message: 'Email added to whitelist successfully',
+      entry: whitelistEntry
+    });
+  } catch (error) {
+    console.error('Add whitelist error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to add email to whitelist: ' + error.message 
+    });
+  }
+});
+
+// Bulk upload emails from Excel (admin only)
+app.post('/whitelist/bulk-upload', requireAdmin, upload.single('file'), async (req, res) => {
+  try {
+    await connectDB();
+    
+    if (!req.file) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'No file uploaded' 
+      });
+    }
+    
+    console.log('Processing Excel file:', req.file.originalname);
+    
+    // Read Excel file
+    const workbook = XLSX.readFile(req.file.path);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    const data = XLSX.utils.sheet_to_json(worksheet);
+    
+    console.log(`Found ${data.length} rows in Excel file`);
+    
+    const results = {
+      success: [],
+      failed: [],
+      skipped: []
+    };
+    
+    // Process each row
+    for (const row of data) {
+      try {
+        // Extract email - handle different column names
+        const email = (row.email || row.Email || row.EMAIL || 
+                      row['Email ID'] || row['email_id'] || '').toString().trim();
+        
+        if (!email || !email.includes('@')) {
+          results.failed.push({ 
+            row, 
+            reason: 'Invalid or missing email' 
+          });
+          continue;
+        }
+        
+        const normalizedEmail = email.toLowerCase();
+        
+        // Extract userType
+        const userType = (row.userType || row.UserType || row.type || row.Type || 
+                         row.designation || row.Designation || 'Student').toString().trim();
+        
+        // Normalize userType
+        let normalizedUserType = 'Student';
+        if (userType.toLowerCase().includes('staff') || userType.toLowerCase().includes('faculty')) {
+          normalizedUserType = 'Staff';
+        }
+        
+        // Extract branch/department
+        const branch = row.branch || row.Branch || row.BRANCH || '';
+        const department = row.department || row.Department || row.DEPARTMENT || '';
+        
+        // Check if already exists
+        const existing = await Whitelist.findOne({ email: normalizedEmail });
+        if (existing) {
+          results.skipped.push({ 
+            email: normalizedEmail, 
+            reason: 'Already exists' 
+          });
+          continue;
+        }
+        
+        // Create whitelist entry
+        const whitelistEntry = new Whitelist({
+          email: normalizedEmail,
+          userType: normalizedUserType,
+          branch: normalizedUserType === 'Student' ? branch : undefined,
+          department: normalizedUserType === 'Staff' ? department : undefined,
+          addedBy: req.auth.userId,
+          notes: `Bulk upload from ${req.file.originalname}`
+        });
+        
+        await whitelistEntry.save();
+        results.success.push({ 
+          email: normalizedEmail, 
+          userType: normalizedUserType 
+        });
+        
+      } catch (rowError) {
+        results.failed.push({ 
+          row, 
+          reason: rowError.message 
+        });
+      }
+    }
+    
+    console.log('Bulk upload results:', {
+      success: results.success.length,
+      failed: results.failed.length,
+      skipped: results.skipped.length
+    });
+    
+    res.json({
+      success: true,
+      message: `Bulk upload completed. Added ${results.success.length} emails.`,
+      results: {
+        added: results.success.length,
+        failed: results.failed.length,
+        skipped: results.skipped.length,
+        details: results
+      }
+    });
+    
+  } catch (error) {
+    console.error('Bulk upload error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to process bulk upload: ' + error.message 
+    });
+  }
+});
+
+// Get all whitelist entries (admin only)
+app.get('/whitelist', requireAdmin, async (req, res) => {
+  try {
+    await connectDB();
+    
+    const { status, userType, search } = req.query;
+    
+    // Build filter
+    const filter = {};
+    if (status) filter.status = status;
+    if (userType) filter.userType = userType;
+    if (search) {
+      filter.$or = [
+        { email: { $regex: search, $options: 'i' } },
+        { branch: { $regex: search, $options: 'i' } },
+        { department: { $regex: search, $options: 'i' } }
+      ];
+    }
+    
+    const entries = await Whitelist.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(1000);
+    
+    // Get counts
+    const counts = {
+      total: await Whitelist.countDocuments({}),
+      pending: await Whitelist.countDocuments({ status: 'pending' }),
+      registered: await Whitelist.countDocuments({ status: 'registered' }),
+      students: await Whitelist.countDocuments({ userType: 'Student' }),
+      staff: await Whitelist.countDocuments({ userType: 'Staff' })
+    };
+    
+    res.json({
+      success: true,
+      entries,
+      counts
+    });
+  } catch (error) {
+    console.error('Get whitelist error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch whitelist' 
+    });
+  }
+});
+
+// Delete whitelist entry (admin only)
+app.delete('/whitelist/:id', requireAdmin, async (req, res) => {
+  try {
+    await connectDB();
+    
+    const entry = await Whitelist.findByIdAndDelete(req.params.id);
+    
+    if (!entry) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Whitelist entry not found' 
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: 'Email removed from whitelist'
+    });
+  } catch (error) {
+    console.error('Delete whitelist error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to delete whitelist entry' 
+    });
+  }
+});
+
+// Check if current user's email is whitelisted (public endpoint with auth)
+app.get('/whitelist/check-me', requireAuth, async (req, res) => {
+  try {
+    await connectDB();
+    
+    const user = await clerkClient.users.getUser(req.auth.userId);
+    const userEmail = user.emailAddresses[0]?.emailAddress;
+    
+    if (!userEmail) {
+      return res.status(400).json({ 
+        success: false,
+        whitelisted: false,
+        message: 'No email found' 
+      });
+    }
+    
+    const whitelistEntry = await Whitelist.findOne({ 
+      email: userEmail.toLowerCase() 
+    });
+    
+    res.json({
+      success: true,
+      whitelisted: !!whitelistEntry,
+      entry: whitelistEntry || null,
+      message: whitelistEntry 
+        ? 'Your email is authorized for KPT Mangalore' 
+        : 'Your email is not in the authorized list. Please contact admin.'
+    });
+  } catch (error) {
+    console.error('Check whitelist error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to check whitelist status' 
+    });
+  }
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
+
+// Start server locally if not running on Vercel
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+  });
+}
 
 // Export the app for Vercel serverless functions
 module.exports = app;

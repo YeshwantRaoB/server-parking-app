@@ -21,7 +21,8 @@
     "express": "^5.1.0",
     "form-data": "^4.0.0",
     "mongoose": "^8.18.2",
-    "multer": "^2.0.2"
+    "multer": "^2.0.2",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
