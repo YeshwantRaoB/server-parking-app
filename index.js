@@ -133,9 +133,12 @@ const vehicleSchema = new mongoose.Schema({
   designation: { type: String, required: true },
   registerNumber: { type: String }, // For students only
   department: { type: String }, // For staff only
+  staffPosition: { type: String }, // Alternative field for staff position
+  vehicleType: { type: String, required: true }, // 2 Wheeler or 4 Wheeler
   vehicleName: { type: String, required: true }, // Vehicle name/model
   vehiclePhotoUrl: { type: String, required: true }, // Vehicle photo
   ownerPhotoUrl: { type: String, required: true }, // Owner photo
+  drivingLicensePhotoUrl: { type: String, required: true }, // Driving license photo
   phoneNumber: { 
     type: String, 
     required: true,
@@ -148,6 +151,7 @@ const vehicleSchema = new mongoose.Schema({
     }
   }, // Owner phone number
   userId: { type: String, required: true }, // Clerk user ID
+  registeredBy: { type: String }, // 'user' or 'admin' - who registered this vehicle
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -258,7 +262,8 @@ app.post('/register', requireAuth, async (req, res) => {
     // Validate required fields
     const requiredFields = [
       'licencePlate', 'fullName', 'branch', 'designation', 
-      'vehicleName', 'vehiclePhotoUrl', 'ownerPhotoUrl', 'phoneNumber'
+      'vehicleName', 'vehicleType', 'vehiclePhotoUrl', 'ownerPhotoUrl', 
+      'drivingLicensePhotoUrl', 'phoneNumber'
     ];
     
     const missingFields = requiredFields.filter(field => !req.body[field]);
@@ -281,10 +286,13 @@ app.post('/register', requireAuth, async (req, res) => {
       department,
       staffPosition,
       vehicleName,
+      vehicleType,
       vehiclePhotoUrl,
       ownerPhotoUrl,
+      drivingLicensePhotoUrl,
       phoneNumber,
-      userId = req.auth?.userId // Fallback to auth userId if not in body
+      userId = req.auth?.userId, // Fallback to auth userId if not in body
+      registeredBy = 'user' // Track who registered this vehicle
     } = req.body;
 
     // Validate phone number format (Indian mobile number)
@@ -348,11 +356,15 @@ app.post('/register', requireAuth, async (req, res) => {
         designation: designation.trim(),
         registerNumber: designation === 'Student' ? registerNumber?.trim() : null,
         department: staffDept?.trim() || null,
+        staffPosition: staffPosition?.trim() || null,
         vehicleName: vehicleName.trim(),
+        vehicleType: vehicleType.trim(),
         vehiclePhotoUrl,
         ownerPhotoUrl,
+        drivingLicensePhotoUrl,
         phoneNumber: phoneNumber.trim(),
-        userId
+        userId,
+        registeredBy
       };
 
       console.log('Vehicle data to save:', JSON.stringify(vehicleData, null, 2));
