@@ -590,8 +590,8 @@ app.get('/vehicles', requireAdmin, async (req, res) => {
   }
 });
 
-// License plate scanning endpoint with Plate Recognizer API (protected, admin only)
-app.post('/scan-plate', requireAdmin, upload.single('image'), async (req, res) => {
+// License plate scanning endpoint with Plate Recognizer API (protected)
+app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) => {
   try {
     console.log('Plate scanning request received');
     
