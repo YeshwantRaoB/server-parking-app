@@ -17,18 +17,22 @@ const allowedOrigins = [
   /.*\.vercel\.app$/, // Allow all Vercel preview deployments
 ];
 
-// CORS middleware
+// CORS middleware - permissive for mobile apps
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (allowedOrigins.some(allowedOrigin => 
+  
+  // For Expo/React Native apps, origin might be null or undefined
+  // Allow requests without origin (mobile apps) or from allowed origins
+  if (!origin || allowedOrigins.some(allowedOrigin => 
     typeof allowedOrigin === 'string' 
       ? origin === allowedOrigin 
       : allowedOrigin.test(origin)
   )) {
-    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Origin', origin || '*');
     res.header('Access-Control-Allow-Credentials', 'true');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
+    res.header('Access-Control-Max-Age', '86400'); // 24 hours
     
     // Handle preflight requests
     if (req.method === 'OPTIONS') {
@@ -857,6 +861,27 @@ app.use((err, req, res, next) => {
     success: false, 
     error: 'Internal server error',
     message: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    success: true, 
+    message: 'Server is running',
+    timestamp: new Date().toISOString(),
+    origin: req.headers.origin || 'none'
+  });
+});
+
+// Test POST endpoint for debugging
+app.post('/test-post', (req, res) => {
+  res.json({
+    success: true,
+    message: 'POST request successful',
+    headers: req.headers,
+    body: req.body,
+    contentType: req.headers['content-type']
   });
 });
 
