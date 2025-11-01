@@ -1234,6 +1234,199 @@ app.get('/vehicles/stats', requireAdmin, async (req, res) => {
   }
 });
 
+// Get detailed statistics combining whitelist and vehicle data (admin only)
+app.get('/statistics/detailed', requireAdmin, async (req, res) => {
+  try {
+    await connectDB();
+    
+    // ===== WHITELIST STATISTICS =====
+    const whitelistStats = {
+      total: await Whitelist.countDocuments({}),
+      registered: await Whitelist.countDocuments({ status: 'registered' }),
+      pending: await Whitelist.countDocuments({ status: 'pending' }),
+      students: await Whitelist.countDocuments({ userType: 'Student' }),
+      staff: await Whitelist.countDocuments({ userType: 'Staff' })
+    };
+    
+    // Student distribution by branch (from whitelist)
+    const whitelistBranches = await Whitelist.aggregate([
+      { $match: { userType: 'Student' } },
+      { $group: { _id: '$branch', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ]);
+    
+    // Staff distribution by department (from whitelist)
+    const whitelistDepartments = await Whitelist.aggregate([
+      { $match: { userType: 'Staff' } },
+      { $group: { _id: '$department', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ]);
+    
+    // ===== VEHICLE STATISTICS =====
+    const vehicleStats = {
+      total: await Vehicle.countDocuments({}),
+      students: await Vehicle.countDocuments({ designation: 'Student' }),
+      staff: await Vehicle.countDocuments({ designation: 'Staff' }),
+      twoWheelers: await Vehicle.countDocuments({ vehicleType: '2 Wheeler' }),
+      fourWheelers: await Vehicle.countDocuments({ vehicleType: '4 Wheeler' })
+    };
+    
+    // Student vehicles by branch
+    const vehicleBranches = await Vehicle.aggregate([
+      { $match: { designation: 'Student' } },
+      { $group: { _id: '$branch', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ]);
+    
+    // Staff vehicles by department
+    const vehicleDepartments = await Vehicle.aggregate([
+      { $match: { designation: 'Staff' } },
+      { $group: { _id: '$department', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ]);
+    
+    // Recent registrations (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const recentVehicles = await Vehicle.countDocuments({
+      createdAt: { $gte: thirtyDaysAgo }
+    });
+    
+    // Monthly vehicle registration trend (last 6 months)
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    
+    const monthlyTrend = await Vehicle.aggregate([
+      { $match: { createdAt: { $gte: sixMonthsAgo } } },
+      {
+        $group: {
+          _id: {
+            year: { $year: '$createdAt' },
+            month: { $month: '$createdAt' }
+          },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1 } }
+    ]);
+    
+    // ===== COMBINED STATISTICS =====
+    // Calculate registration rate (users with vehicles vs total users)
+    const registrationRate = whitelistStats.registered > 0 
+      ? ((vehicleStats.total / whitelistStats.registered) * 100).toFixed(1)
+      : '0.0';
+    
+    // Department-wise detailed breakdown for staff
+    const departmentDetails = await Vehicle.aggregate([
+      { $match: { designation: 'Staff' } },
+      {
+        $group: {
+          _id: '$department',
+          vehicleCount: { $sum: 1 },
+          twoWheelers: {
+            $sum: { $cond: [{ $eq: ['$vehicleType', '2 Wheeler'] }, 1, 0] }
+          },
+          fourWheelers: {
+            $sum: { $cond: [{ $eq: ['$vehicleType', '4 Wheeler'] }, 1, 0] }
+          }
+        }
+      },
+      { $sort: { vehicleCount: -1 } }
+    ]);
+    
+    // Branch-wise detailed breakdown for students
+    const branchDetails = await Vehicle.aggregate([
+      { $match: { designation: 'Student' } },
+      {
+        $group: {
+          _id: '$branch',
+          vehicleCount: { $sum: 1 },
+          twoWheelers: {
+            $sum: { $cond: [{ $eq: ['$vehicleType', '2 Wheeler'] }, 1, 0] }
+          },
+          fourWheelers: {
+            $sum: { $cond: [{ $eq: ['$vehicleType', '4 Wheeler'] }, 1, 0] }
+          }
+        }
+      },
+      { $sort: { vehicleCount: -1 } }
+    ]);
+
+    res.json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      
+      // User Registration Statistics
+      users: {
+        total: whitelistStats.total,
+        registered: whitelistStats.registered,
+        pending: whitelistStats.pending,
+        students: whitelistStats.students,
+        staff: whitelistStats.staff,
+        studentBranches: whitelistBranches.map(b => ({ 
+          branch: b._id || 'Not Specified', 
+          count: b.count 
+        })),
+        staffDepartments: whitelistDepartments.map(d => ({ 
+          department: d._id || 'Not Specified', 
+          count: d.count 
+        }))
+      },
+      
+      // Vehicle Statistics
+      vehicles: {
+        total: vehicleStats.total,
+        students: vehicleStats.students,
+        staff: vehicleStats.staff,
+        twoWheelers: vehicleStats.twoWheelers,
+        fourWheelers: vehicleStats.fourWheelers,
+        recent: recentVehicles,
+        studentBranches: vehicleBranches.map(b => ({ 
+          branch: b._id || 'Not Specified', 
+          count: b.count 
+        })),
+        staffDepartments: vehicleDepartments.map(d => ({ 
+          department: d._id || 'Not Specified', 
+          count: d.count 
+        })),
+        monthlyTrend: monthlyTrend.map(m => ({
+          month: `${m._id.year}-${String(m._id.month).padStart(2, '0')}`,
+          year: m._id.year,
+          monthNumber: m._id.month,
+          count: m.count
+        }))
+      },
+      
+      // Combined Insights
+      insights: {
+        registrationRate: parseFloat(registrationRate),
+        totalAuthorizedUsers: whitelistStats.registered,
+        totalVehiclesRegistered: vehicleStats.total,
+        usersWithoutVehicles: Math.max(0, whitelistStats.registered - vehicleStats.total),
+        departmentDetails: departmentDetails.map(d => ({
+          department: d._id || 'Not Specified',
+          totalVehicles: d.vehicleCount,
+          twoWheelers: d.twoWheelers,
+          fourWheelers: d.fourWheelers
+        })),
+        branchDetails: branchDetails.map(b => ({
+          branch: b._id || 'Not Specified',
+          totalVehicles: b.vehicleCount,
+          twoWheelers: b.twoWheelers,
+          fourWheelers: b.fourWheelers
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Detailed stats error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch detailed statistics',
+      message: error.message 
+    });
+  }
+});
+
 // Update a vehicle by ID (admin only)
 app.patch('/vehicles/:id', requireAdmin, async (req, res) => {
   try {
