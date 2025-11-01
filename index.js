@@ -219,7 +219,10 @@ const Vehicle = mongoose.model('Vehicle', vehicleSchema);
 // User schema for storing push tokens and other user data
 const userSchema = new mongoose.Schema({
   clerkId: { type: String, required: true, unique: true },
-  pushToken: { type: String },
+  pushToken: { type: String }, // Expo push token
+  fcmToken: { type: String }, // Firebase Cloud Messaging token
+  platform: { type: String }, // 'ios' or 'android'
+  isAdmin: { type: Boolean, default: false }, // Admin flag for notifications
   role: { type: String, default: 'user' },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
@@ -266,29 +269,77 @@ whitelistSchema.index({ email: 1, status: 1 });
 
 const Whitelist = mongoose.model('Whitelist', whitelistSchema);
 
-// Notification helper function
-const sendPushNotification = async (pushToken, title, body, data = {}) => {
-  if (!Expo.isExpoPushToken(pushToken)) {
-    console.error(`Push token ${pushToken} is not a valid Expo push token`);
-    return;
+// Import Firebase Admin SDK for FCM
+const admin = require('firebase-admin');
+
+// Initialize Firebase Admin SDK if credentials are available
+let firebaseAdmin = null;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+    firebaseAdmin = admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('Firebase Admin SDK initialized successfully');
+  } else {
+    console.warn('FIREBASE_SERVICE_ACCOUNT_KEY not found. FCM notifications will not work.');
   }
+} catch (error) {
+  console.error('Failed to initialize Firebase Admin SDK:', error.message);
+}
 
-  const expo = new Expo();
-  const message = {
-    to: pushToken,
-    title,
-    body,
-    data,
-    sound: 'default',
-    priority: 'default',
-  };
-
+// Notification helper function - supports both Expo and FCM tokens
+const sendPushNotification = async (token, title, body, data = {}, platform = 'expo') => {
   try {
+    // If it's an FCM token, use Firebase Admin SDK
+    if (platform === 'fcm' && firebaseAdmin) {
+      const message = {
+        notification: {
+          title,
+          body,
+        },
+        data: {
+          ...data,
+          title, // Include title in data for custom handling
+          body,  // Include body in data for custom handling
+        },
+        token: token,
+        android: {
+          priority: 'high',
+          notification: {
+            sound: 'default',
+            channelId: 'default',
+          },
+        },
+      };
+
+      const response = await admin.messaging().send(message);
+      console.log('FCM notification sent successfully:', response);
+      return { success: true, response };
+    }
+    
+    // Otherwise, use Expo push notifications
+    if (!Expo.isExpoPushToken(token)) {
+      console.error(`Token ${token} is not a valid Expo push token`);
+      return { success: false, error: 'Invalid Expo token' };
+    }
+
+    const expo = new Expo();
+    const message = {
+      to: token,
+      title,
+      body,
+      data,
+      sound: 'default',
+      priority: 'default',
+    };
+
     const ticket = await expo.sendPushNotificationsAsync([message]);
-    console.log('Notification sent:', ticket);
-    return ticket;
+    console.log('Expo notification sent:', ticket);
+    return { success: true, ticket };
   } catch (error) {
     console.error('Error sending notification:', error);
+    return { success: false, error: error.message };
   }
 };
 
@@ -296,23 +347,45 @@ const sendPushNotification = async (pushToken, title, body, data = {}) => {
 app.post('/register-push-token', requireAuth, async (req, res) => {
   try {
     await connectDB();
-    const { pushToken } = req.body;
+    const { pushToken, fcmToken, platform } = req.body;
 
-    if (!pushToken) {
-      return res.status(400).json({ error: 'Push token is required' });
+    if (!pushToken && !fcmToken) {
+      return res.status(400).json({ error: 'At least one push token is required' });
     }
 
-    // Upsert user with push token
-    await User.findOneAndUpdate(
+    console.log('Registering push tokens for user:', req.auth.userId);
+    console.log('Expo token:', pushToken);
+    console.log('FCM token:', fcmToken);
+    console.log('Platform:', platform);
+
+    // Get user role from Clerk to determine if admin
+    let isAdmin = false;
+    try {
+      const clerkUser = await clerkClient.users.getUser(req.auth.userId);
+      isAdmin = clerkUser.publicMetadata?.role === 'admin';
+      console.log('User is admin:', isAdmin);
+    } catch (error) {
+      console.error('Error fetching user from Clerk:', error);
+    }
+
+    // Upsert user with push tokens
+    const updateData = {
+      updatedAt: new Date(),
+      isAdmin,
+    };
+    
+    if (pushToken) updateData.pushToken = pushToken;
+    if (fcmToken) updateData.fcmToken = fcmToken;
+    if (platform) updateData.platform = platform;
+
+    const user = await User.findOneAndUpdate(
       { clerkId: req.auth.userId },
-      {
-        pushToken,
-        updatedAt: new Date()
-      },
+      updateData,
       { upsert: true, new: true }
     );
 
-    res.json({ success: true, message: 'Push token registered successfully' });
+    console.log('User tokens registered:', user);
+    res.json({ success: true, message: 'Push tokens registered successfully', isAdmin });
   } catch (error) {
     console.error('Push token registration error:', error);
     res.status(500).json({ error: 'Failed to register push token' });
@@ -477,26 +550,47 @@ app.post('/register', requireAuthWithWhitelist, async (req, res) => {
         console.log(`Found ${admins.length} admins to notify`);
         
         const notificationPromises = admins.map(admin => {
-          if (admin.pushToken) {
-            console.log(`Sending notification to admin: ${admin._id}`);
+          // Try FCM token first, then fall back to Expo token
+          if (admin.fcmToken) {
+            console.log(`Sending FCM notification to admin: ${admin.clerkId}`);
+            return sendPushNotification(
+              admin.fcmToken,
+              'New Vehicle Registered',
+              `${fullName} has registered their vehicle (${normalizedPlate})`,
+              { 
+                screen: 'Admin',
+                vehicleId: savedVehicle._id.toString(),
+                type: 'vehicle_registration'
+              },
+              'fcm'
+            ).catch(e => {
+              console.error(`Failed to send FCM notification to admin ${admin.clerkId}:`, e);
+              return null;
+            });
+          } else if (admin.pushToken) {
+            console.log(`Sending Expo notification to admin: ${admin.clerkId}`);
             return sendPushNotification(
               admin.pushToken,
               'New Vehicle Registered',
-              `Vehicle ${normalizedPlate} registered by ${fullName}`,
+              `${fullName} has registered their vehicle (${normalizedPlate})`,
               { 
                 screen: 'Admin',
-                vehicleId: savedVehicle._id
-              }
+                vehicleId: savedVehicle._id.toString(),
+                type: 'vehicle_registration'
+              },
+              'expo'
             ).catch(e => {
-              console.error(`Failed to send notification to admin ${admin._id}:`, e);
+              console.error(`Failed to send Expo notification to admin ${admin.clerkId}:`, e);
               return null;
             });
+          } else {
+            console.log(`Admin ${admin.clerkId} has no push tokens registered`);
+            return Promise.resolve();
           }
-          return Promise.resolve();
         });
 
         await Promise.all(notificationPromises);
-        console.log('All notifications sent');
+        console.log('All admin notifications sent');
       } catch (notificationError) {
         console.error('Error in notification process:', notificationError);
         // Don't fail the request if notifications fail
