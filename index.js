@@ -822,11 +822,12 @@ app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) =>
     formData.append('upload', fs.createReadStream(req.file.path));
     
     // Add regions for better accuracy - India uses 'in'
+    // Note: We're not using strict mode to allow for variations in plate formats
     formData.append('regions', 'in');
     
     // Add configuration for better detection
+    // Using 'normal' mode instead of 'strict' to handle format variations
     formData.append('config', JSON.stringify({
-      region: 'strict',  // Only return results matching the specified region
       mode: 'fast'       // Use fast mode for quicker results
     }));
     
@@ -891,10 +892,11 @@ app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) =>
     // Check if any plates were detected
     if (!plateData.results || plateData.results.length === 0) {
       console.log('No plates detected in image');
+      console.log('API response:', JSON.stringify(plateData, null, 2));
       return res.json({
         success: true,
         found: false,
-        message: 'No license plate detected in the image. Please ensure the plate is clearly visible and try again.',
+        message: 'No license plate detected in the image. Please ensure the plate is clearly visible, well-lit, and not obscured. Try taking the photo from a closer distance.',
         plateDetected: false,
         apiResponse: {
           processing_time: plateData.processing_time,
@@ -930,8 +932,9 @@ app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) =>
     
     console.log('Detected plate:', detectedPlate, 'Confidence:', confidence);
 
-    // Check confidence threshold (Plate Recognizer recommends 0.7 for high confidence)
-    if (confidence < 0.5) {
+    // Check confidence threshold (lowered to 0.3 to catch more plates)
+    // Plate Recognizer recommends 0.7 for high confidence, but we'll be more lenient
+    if (confidence < 0.3) {
       console.log('Low confidence detection:', confidence);
       return res.json({
         success: true,
@@ -941,6 +944,8 @@ app.post('/scan-plate', requireAuth, upload.single('image'), async (req, res) =>
         confidence: confidence,
         message: `Low confidence detection (${Math.round(confidence * 100)}%). Please try again with better lighting and angle.`
       });
+    } else if (confidence < 0.5) {
+      console.log('Medium confidence detection:', confidence, '- proceeding with search');
     }
 
     // Search database for the detected plate
