@@ -288,6 +288,34 @@ try {
   console.error('Failed to initialize Firebase Admin SDK:', error.message);
 }
 
+// Vehicle Entry Log Schema - Track vehicle entry/exit
+const vehicleEntryLogSchema = new mongoose.Schema({
+  licencePlate: { type: String, required: true, index: true },
+  vehicleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle' }, // Reference to registered vehicle
+  timestamp: { type: Date, required: true, default: Date.now, index: true },
+  eventType: { type: String, enum: ['entry', 'exit'], required: true },
+  imageUrl: { type: String }, // Screenshot from camera
+  confidence: { type: Number }, // Detection confidence score
+  cameraId: { type: String, default: 'camera-1' },
+  isRegistered: { type: Boolean, default: false },
+  vehicleInfo: { // Snapshot of vehicle info at time of detection
+    fullName: String,
+    branch: String,
+    designation: String,
+    vehicleName: String,
+    phoneNumber: String
+  },
+  notificationSent: { type: Boolean, default: false }, // Track if admin was notified
+  createdAt: { type: Date, default: Date.now, index: true }
+});
+
+// Index for efficient queries
+vehicleEntryLogSchema.index({ licencePlate: 1, createdAt: -1 });
+vehicleEntryLogSchema.index({ createdAt: -1 });
+vehicleEntryLogSchema.index({ isRegistered: 1, createdAt: -1 });
+
+const VehicleEntryLog = mongoose.model('VehicleEntryLog', vehicleEntryLogSchema);
+
 // Notification helper function - supports both Expo and FCM tokens
 const sendPushNotification = async (token, title, body, data = {}, platform = 'expo') => {
   try {
@@ -1066,6 +1094,330 @@ app.get('/vehicles/lookup/:licensePlate', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('License plate lookup error:', err);
     res.status(500).json({ success: false, error: 'Failed to lookup license plate' });
+  }
+});
+
+// =============================================
+// PLATE RECOGNIZER STREAM WEBHOOK ENDPOINT
+// =============================================
+
+// Webhook endpoint to receive plate detections from Plate Recognizer Stream
+app.post('/webhook/plate-detection', async (req, res) => {
+  try {
+    console.log('\n=== Plate Detection Webhook Received ===');
+    console.log('Headers:', JSON.stringify(req.headers, null, 2));
+    console.log('Body:', JSON.stringify(req.body, null, 2));
+    
+    await connectDB();
+    
+    // Extract data from webhook payload
+    const { data } = req.body;
+    
+    if (!data || !data.results || data.results.length === 0) {
+      console.log('No plate detected in webhook');
+      return res.json({ success: true, message: 'No plate detected' });
+    }
+    
+    // Get the best plate result
+    const plateResult = data.results[0];
+    const detectedPlate = plateResult.plate.toUpperCase().replace(/\s+/g, '');
+    const confidence = plateResult.score || 0;
+    const timestamp = new Date(data.timestamp || Date.now());
+    const cameraId = data.camera_id || 'camera-1';
+    
+    // Get image URL if available
+    let imageUrl = null;
+    if (data.filename) {
+      // Construct image URL - adjust based on your setup
+      imageUrl = data.filename;
+    }
+    
+    console.log('Detected Plate:', detectedPlate);
+    console.log('Confidence:', confidence);
+    console.log('Timestamp:', timestamp);
+    console.log('Camera ID:', cameraId);
+    
+    // Search for vehicle in database
+    const vehicle = await Vehicle.findOne({
+      licencePlate: { $regex: new RegExp(`^${detectedPlate}$`, 'i') }
+    }).lean().exec();
+    
+    // Determine if this is entry or exit
+    // Logic: Check last log entry for this plate
+    const lastLog = await VehicleEntryLog.findOne({
+      licencePlate: detectedPlate
+    }).sort({ createdAt: -1 }).lean().exec();
+    
+    let eventType = 'entry';
+    if (lastLog) {
+      // If last event was entry, this is exit
+      // If last event was exit, this is entry
+      // Also check if it's been more than 5 minutes (to avoid duplicate detections)
+      const timeDiff = (timestamp - new Date(lastLog.createdAt)) / 1000 / 60; // minutes
+      
+      if (timeDiff < 2) {
+        // Too soon, likely duplicate detection - ignore
+        console.log('Duplicate detection ignored (< 2 minutes since last)');
+        return res.json({ success: true, message: 'Duplicate detection ignored' });
+      }
+      
+      eventType = lastLog.eventType === 'entry' ? 'exit' : 'entry';
+    }
+    
+    console.log('Event Type:', eventType);
+    console.log('Vehicle Found:', !!vehicle);
+    
+    // Create entry log
+    const entryLog = new VehicleEntryLog({
+      licencePlate: detectedPlate,
+      vehicleId: vehicle ? vehicle._id : null,
+      timestamp,
+      eventType,
+      imageUrl,
+      confidence,
+      cameraId,
+      isRegistered: !!vehicle,
+      vehicleInfo: vehicle ? {
+        fullName: vehicle.fullName,
+        branch: vehicle.branch,
+        designation: vehicle.designation,
+        vehicleName: vehicle.vehicleName,
+        phoneNumber: vehicle.phoneNumber
+      } : null
+    });
+    
+    await entryLog.save();
+    console.log('Entry log saved:', entryLog._id);
+    
+    // Send notification to admins if vehicle is NOT registered
+    if (!vehicle && eventType === 'entry') {
+      console.log('Unregistered vehicle detected - sending notifications to admins');
+      
+      try {
+        const admins = await User.find({ isAdmin: true });
+        console.log(`Found ${admins.length} admins to notify`);
+        
+        const notificationPromises = admins.map(admin => {
+          const title = '⚠️ Unregistered Vehicle Detected';
+          const body = `License Plate: ${detectedPlate}\nTime: ${timestamp.toLocaleString()}\nConfidence: ${Math.round(confidence * 100)}%`;
+          
+          if (admin.fcmToken) {
+            return sendPushNotification(
+              admin.fcmToken,
+              title,
+              body,
+              {
+                screen: 'Admin',
+                type: 'unregistered_vehicle',
+                licencePlate: detectedPlate,
+                timestamp: timestamp.toISOString(),
+                logId: entryLog._id.toString()
+              },
+              'fcm'
+            ).catch(e => {
+              console.error(`Failed to send FCM notification:`, e);
+              return null;
+            });
+          } else if (admin.pushToken) {
+            return sendPushNotification(
+              admin.pushToken,
+              title,
+              body,
+              {
+                screen: 'Admin',
+                type: 'unregistered_vehicle',
+                licencePlate: detectedPlate,
+                timestamp: timestamp.toISOString(),
+                logId: entryLog._id.toString()
+              },
+              'expo'
+            ).catch(e => {
+              console.error(`Failed to send Expo notification:`, e);
+              return null;
+            });
+          }
+          return Promise.resolve();
+        });
+        
+        await Promise.all(notificationPromises);
+        entryLog.notificationSent = true;
+        await entryLog.save();
+        console.log('Admin notifications sent successfully');
+      } catch (notificationError) {
+        console.error('Error sending notifications:', notificationError);
+      }
+    } else if (vehicle) {
+      console.log(`Registered vehicle ${eventType}: ${vehicle.fullName} (${detectedPlate})`);
+    }
+    
+    res.json({
+      success: true,
+      message: 'Plate detection processed',
+      data: {
+        licencePlate: detectedPlate,
+        eventType,
+        isRegistered: !!vehicle,
+        logId: entryLog._id
+      }
+    });
+    
+  } catch (error) {
+    console.error('Webhook processing error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process webhook',
+      message: error.message
+    });
+  }
+});
+
+// Get daily vehicle entry logs (admin only)
+app.get('/logs/daily', requireAdmin, async (req, res) => {
+  try {
+    await connectDB();
+    
+    const { date, licencePlate, eventType, isRegistered } = req.query;
+    
+    // Build filter
+    const filter = {};
+    
+    // Date filter - default to today
+    let startDate, endDate;
+    if (date) {
+      startDate = new Date(date);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = new Date(date);
+      endDate.setHours(23, 59, 59, 999);
+    } else {
+      // Today
+      startDate = new Date();
+      startDate.setHours(0, 0, 0, 0);
+      endDate = new Date();
+      endDate.setHours(23, 59, 59, 999);
+    }
+    
+    filter.createdAt = { $gte: startDate, $lte: endDate };
+    
+    if (licencePlate) {
+      filter.licencePlate = { $regex: licencePlate, $options: 'i' };
+    }
+    
+    if (eventType) {
+      filter.eventType = eventType;
+    }
+    
+    if (isRegistered !== undefined) {
+      filter.isRegistered = isRegistered === 'true';
+    }
+    
+    // Get logs
+    const logs = await VehicleEntryLog.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .lean()
+      .exec();
+    
+    // Get statistics
+    const stats = {
+      totalEntries: await VehicleEntryLog.countDocuments({ ...filter, eventType: 'entry' }),
+      totalExits: await VehicleEntryLog.countDocuments({ ...filter, eventType: 'exit' }),
+      registeredVehicles: await VehicleEntryLog.countDocuments({ ...filter, isRegistered: true }),
+      unregisteredVehicles: await VehicleEntryLog.countDocuments({ ...filter, isRegistered: false }),
+      uniqueVehicles: (await VehicleEntryLog.distinct('licencePlate', filter)).length
+    };
+    
+    res.json({
+      success: true,
+      date: startDate.toISOString().split('T')[0],
+      logs,
+      stats,
+      count: logs.length
+    });
+    
+  } catch (error) {
+    console.error('Daily logs error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch daily logs',
+      message: error.message
+    });
+  }
+});
+
+// Get vehicle entry/exit history (admin only)
+app.get('/logs/vehicle/:licencePlate', requireAdmin, async (req, res) => {
+  try {
+    await connectDB();
+    
+    const { licencePlate } = req.params;
+    const { limit = 50, skip = 0 } = req.query;
+    
+    const logs = await VehicleEntryLog.find({
+      licencePlate: { $regex: new RegExp(`^${licencePlate}$`, 'i') }
+    })
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(skip))
+      .lean()
+      .exec();
+    
+    const total = await VehicleEntryLog.countDocuments({
+      licencePlate: { $regex: new RegExp(`^${licencePlate}$`, 'i') }
+    });
+    
+    res.json({
+      success: true,
+      licencePlate,
+      logs,
+      total,
+      count: logs.length
+    });
+    
+  } catch (error) {
+    console.error('Vehicle history error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch vehicle history',
+      message: error.message
+    });
+  }
+});
+
+// Get current vehicles in campus (entries without exits)
+app.get('/logs/current-vehicles', requireAdmin, async (req, res) => {
+  try {
+    await connectDB();
+    
+    // Get all unique license plates with their last log entry
+    const allPlates = await VehicleEntryLog.distinct('licencePlate');
+    
+    const currentVehicles = [];
+    
+    for (const plate of allPlates) {
+      const lastLog = await VehicleEntryLog.findOne({ licencePlate: plate })
+        .sort({ createdAt: -1 })
+        .lean()
+        .exec();
+      
+      // If last event was entry, vehicle is currently in campus
+      if (lastLog && lastLog.eventType === 'entry') {
+        currentVehicles.push(lastLog);
+      }
+    }
+    
+    res.json({
+      success: true,
+      currentVehicles,
+      count: currentVehicles.length
+    });
+    
+  } catch (error) {
+    console.error('Current vehicles error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch current vehicles',
+      message: error.message
+    });
   }
 });
 
