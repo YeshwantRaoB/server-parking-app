@@ -1131,17 +1131,20 @@ app.post('/webhook/plate-detection', upload.single('upload'), async (req, res) =
     
     console.log('Parsed data:', JSON.stringify(data, null, 2));
     
-    if (!data || !data.results || data.results.length === 0) {
+    // Stream sends data in a nested structure: data.data.results
+    const detectionData = data.data || data;
+    
+    if (!detectionData || !detectionData.results || detectionData.results.length === 0) {
       console.log('No plate detected in webhook');
       return res.json({ success: true, message: 'No plate detected' });
     }
     
     // Get the best plate result
-    const plateResult = data.results[0];
+    const plateResult = detectionData.results[0];
     const detectedPlate = plateResult.plate.toUpperCase().replace(/\s+/g, '');
     const confidence = plateResult.score || 0;
-    const timestamp = new Date(data.timestamp || Date.now());
-    const cameraId = data.camera_id || 'camera-1';
+    const timestamp = new Date(detectionData.timestamp || Date.now());
+    const cameraId = detectionData.camera_id || 'camera-1';
     
     // Get image URL if available (from uploaded file or data)
     let imageUrl = null;
@@ -1153,8 +1156,8 @@ app.post('/webhook/plate-detection', upload.single('upload'), async (req, res) =
       // const cloudinaryResult = await cloudinary.uploader.upload(req.file.path);
       // imageUrl = cloudinaryResult.secure_url;
     }
-    if (data.filename) {
-      imageUrl = data.filename;
+    if (detectionData.filename) {
+      imageUrl = detectionData.filename;
     }
     
     console.log('Detected Plate:', detectedPlate);
