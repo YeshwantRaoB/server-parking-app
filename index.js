@@ -1102,16 +1102,34 @@ app.get('/vehicles/lookup/:licensePlate', requireAdmin, async (req, res) => {
 // =============================================
 
 // Webhook endpoint to receive plate detections from Plate Recognizer Stream
-app.post('/webhook/plate-detection', async (req, res) => {
+app.post('/webhook/plate-detection', upload.single('upload'), async (req, res) => {
   try {
     console.log('\n=== Plate Detection Webhook Received ===');
-    console.log('Headers:', JSON.stringify(req.headers, null, 2));
-    console.log('Body:', JSON.stringify(req.body, null, 2));
+    console.log('Content-Type:', req.headers['content-type']);
+    console.log('Body fields:', req.body ? Object.keys(req.body) : 'none');
+    console.log('File received:', req.file ? 'yes' : 'no');
     
     await connectDB();
     
-    // Extract data from webhook payload
-    const { data } = req.body;
+    // Plate Recognizer Stream sends data as form fields, not JSON
+    // The JSON data is in the 'json' field
+    let data;
+    if (req.body && req.body.json) {
+      // Parse the JSON string from the form field
+      data = JSON.parse(req.body.json);
+    } else if (req.body && req.body.data) {
+      // Fallback: check if data is directly in body
+      data = typeof req.body.data === 'string' ? JSON.parse(req.body.data) : req.body.data;
+    } else {
+      console.error('No data found in webhook payload');
+      console.log('Available body fields:', req.body);
+      return res.status(400).json({ 
+        success: false, 
+        error: 'No data in webhook payload' 
+      });
+    }
+    
+    console.log('Parsed data:', JSON.stringify(data, null, 2));
     
     if (!data || !data.results || data.results.length === 0) {
       console.log('No plate detected in webhook');
@@ -1125,10 +1143,17 @@ app.post('/webhook/plate-detection', async (req, res) => {
     const timestamp = new Date(data.timestamp || Date.now());
     const cameraId = data.camera_id || 'camera-1';
     
-    // Get image URL if available
+    // Get image URL if available (from uploaded file or data)
     let imageUrl = null;
+    if (req.file) {
+      // If image was uploaded, you could upload to Cloudinary here
+      // For now, we'll just note that we received it
+      console.log('Image file received:', req.file.originalname, req.file.size, 'bytes');
+      // Optionally upload to Cloudinary:
+      // const cloudinaryResult = await cloudinary.uploader.upload(req.file.path);
+      // imageUrl = cloudinaryResult.secure_url;
+    }
     if (data.filename) {
-      // Construct image URL - adjust based on your setup
       imageUrl = data.filename;
     }
     
