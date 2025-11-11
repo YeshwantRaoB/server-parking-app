@@ -1414,6 +1414,127 @@ app.get('/logs/daily', requireAdmin, async (req, res) => {
   }
 });
 
+// Middleware to accept token from query parameter (for mobile download compatibility)
+const requireAdminWithQueryToken = async (req, res, next) => {
+  try {
+    // Check if token is in query parameter
+    const queryToken = req.query.token;
+    
+    if (queryToken) {
+      // Set it in the Authorization header for Clerk middleware
+      req.headers.authorization = `Bearer ${queryToken}`;
+    }
+    
+    // Now use the regular requireAdmin middleware
+    return requireAdmin[0](req, res, (err) => {
+      if (err) return next(err);
+      return requireAdmin[1](req, res, next);
+    });
+  } catch (error) {
+    console.error('Token query parameter error:', error);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+};
+
+// Export daily logs to Excel (admin only)
+app.get('/logs/daily/export', requireAdminWithQueryToken, async (req, res) => {
+  try {
+    await connectDB();
+    
+    const { date } = req.query;
+    
+    // Build filter
+    const filter = {};
+    
+    // Date filter - default to today
+    let startDate, endDate;
+    if (date) {
+      startDate = new Date(date);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = new Date(date);
+      endDate.setHours(23, 59, 59, 999);
+    } else {
+      // Today
+      startDate = new Date();
+      startDate.setHours(0, 0, 0, 0);
+      endDate = new Date();
+      endDate.setHours(23, 59, 59, 999);
+    }
+    
+    filter.createdAt = { $gte: startDate, $lte: endDate };
+    
+    // Get all logs for the day
+    const logs = await VehicleEntryLog.find(filter)
+      .sort({ createdAt: -1 })
+      .lean()
+      .exec();
+    
+    // Format data for Excel
+    const excelData = logs.map((log, index) => ({
+      'S.No': index + 1,
+      'License Plate': log.licencePlate,
+      'Event Type': log.eventType.toUpperCase(),
+      'Date': new Date(log.timestamp).toLocaleDateString('en-IN'),
+      'Time': new Date(log.timestamp).toLocaleTimeString('en-IN'),
+      'Registration Status': log.isRegistered ? 'Registered' : 'Unregistered',
+      'Owner Name': log.vehicleInfo?.fullName || 'N/A',
+      'Vehicle Model': log.vehicleInfo?.vehicleName || 'N/A',
+      'Designation': log.vehicleInfo?.designation || 'N/A',
+      'Branch/Department': log.vehicleInfo?.branch || 'N/A',
+      'Phone Number': log.vehicleInfo?.phoneNumber || 'N/A',
+      'Confidence': log.confidence ? `${Math.round(log.confidence * 100)}%` : 'N/A',
+      'Camera ID': log.cameraId || 'N/A'
+    }));
+    
+    // Create workbook and worksheet
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(excelData);
+    
+    // Set column widths
+    ws['!cols'] = [
+      { wch: 6 },  // S.No
+      { wch: 15 }, // License Plate
+      { wch: 10 }, // Event Type
+      { wch: 12 }, // Date
+      { wch: 12 }, // Time
+      { wch: 18 }, // Registration Status
+      { wch: 25 }, // Owner Name
+      { wch: 20 }, // Vehicle Model
+      { wch: 12 }, // Designation
+      { wch: 25 }, // Branch/Department
+      { wch: 15 }, // Phone Number
+      { wch: 12 }, // Confidence
+      { wch: 12 }  // Camera ID
+    ];
+    
+    // Add worksheet to workbook
+    XLSX.utils.book_append_sheet(wb, ws, 'Vehicle Logs');
+    
+    // Generate buffer
+    const excelBuffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    
+    // Set headers for file download
+    const dateStr = startDate.toISOString().split('T')[0];
+    const filename = `Vehicle_Logs_${dateStr}.xlsx`;
+    
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', excelBuffer.length);
+    
+    res.send(excelBuffer);
+    
+    console.log(`Excel export generated: ${filename} (${logs.length} records)`);
+    
+  } catch (error) {
+    console.error('Excel export error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to export logs',
+      message: error.message
+    });
+  }
+});
+
 // Get vehicle entry/exit history (admin only)
 app.get('/logs/vehicle/:licencePlate', requireAdmin, async (req, res) => {
   try {
