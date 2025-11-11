@@ -1149,14 +1149,33 @@ app.post('/webhook/plate-detection', upload.single('upload'), async (req, res) =
     // Get image URL if available (from uploaded file or data)
     let imageUrl = null;
     if (req.file) {
-      // If image was uploaded, you could upload to Cloudinary here
-      // For now, we'll just note that we received it
+      // Upload image to Cloudinary
       console.log('Image file received:', req.file.originalname, req.file.size, 'bytes');
-      // Optionally upload to Cloudinary:
-      // const cloudinaryResult = await cloudinary.uploader.upload(req.file.path);
-      // imageUrl = cloudinaryResult.secure_url;
+      try {
+        console.log('Uploading image to Cloudinary...');
+        const cloudinaryResult = await cloudinary.uploader.upload(req.file.path, {
+          folder: 'parking-app/detections',
+          resource_type: 'image',
+          quality: 'auto:good',
+          format: 'jpg',
+          transformation: [
+            { width: 1200, crop: 'limit' }
+          ]
+        });
+        imageUrl = cloudinaryResult.secure_url;
+        console.log('Image uploaded to Cloudinary:', imageUrl);
+        
+        // Clean up temp file
+        const fs = require('fs');
+        fs.unlink(req.file.path, (err) => {
+          if (err) console.error('Error deleting temp file:', err);
+        });
+      } catch (uploadError) {
+        console.error('Error uploading to Cloudinary:', uploadError);
+        // Continue without image if upload fails
+      }
     }
-    if (detectionData.filename) {
+    if (!imageUrl && detectionData.filename) {
       imageUrl = detectionData.filename;
     }
     
