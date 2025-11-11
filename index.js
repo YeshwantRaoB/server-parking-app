@@ -210,6 +210,7 @@ const vehicleSchema = new mongoose.Schema({
   }, // Owner phone number
   userId: { type: String, required: true }, // Clerk user ID
   registeredBy: { type: String }, // 'user' or 'admin' - who registered this vehicle
+  notifyOnEntry: { type: Boolean, default: false }, // Admin notification preference for this vehicle
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -1236,62 +1237,84 @@ app.post('/webhook/plate-detection', upload.single('upload'), async (req, res) =
     await entryLog.save();
     console.log('Entry log saved:', entryLog._id);
     
-    // Send notification to admins if vehicle is NOT registered
-    if (!vehicle && eventType === 'entry') {
-      console.log('Unregistered vehicle detected - sending notifications to admins');
+    // Send notification to admins based on vehicle status and preferences
+    if (eventType === 'entry') {
+      let shouldNotify = false;
+      let notificationTitle = '';
+      let notificationBody = '';
+      let notificationType = '';
       
-      try {
-        const admins = await User.find({ isAdmin: true });
-        console.log(`Found ${admins.length} admins to notify`);
-        
-        const notificationPromises = admins.map(admin => {
-          const title = '⚠️ Unregistered Vehicle Detected';
-          const body = `License Plate: ${detectedPlate}\nTime: ${timestamp.toLocaleString()}\nConfidence: ${Math.round(confidence * 100)}%`;
+      if (!vehicle) {
+        // Unregistered vehicle - always notify
+        shouldNotify = true;
+        notificationTitle = '⚠️ Unregistered Vehicle Detected';
+        notificationBody = `License Plate: ${detectedPlate}\nTime: ${timestamp.toLocaleString()}\nConfidence: ${Math.round(confidence * 100)}%`;
+        notificationType = 'unregistered_vehicle';
+        console.log('Unregistered vehicle detected - sending notifications to admins');
+      } else if (vehicle.notifyOnEntry) {
+        // Registered vehicle with notification enabled
+        shouldNotify = true;
+        notificationTitle = '🔔 Vehicle Entry Alert';
+        notificationBody = `${vehicle.fullName} (${detectedPlate})\n${vehicle.vehicleName}\nTime: ${timestamp.toLocaleString()}`;
+        notificationType = 'registered_vehicle_entry';
+        console.log(`Registered vehicle with notification enabled: ${vehicle.fullName} (${detectedPlate})`);
+      } else {
+        console.log(`Registered vehicle ${eventType}: ${vehicle.fullName} (${detectedPlate}) - no notification`);
+      }
+      
+      if (shouldNotify) {
+        try {
+          const admins = await User.find({ isAdmin: true });
+          console.log(`Found ${admins.length} admins to notify`);
           
-          if (admin.fcmToken) {
-            return sendPushNotification(
-              admin.fcmToken,
-              title,
-              body,
-              {
-                screen: 'Admin',
-                type: 'unregistered_vehicle',
-                licencePlate: detectedPlate,
-                timestamp: timestamp.toISOString(),
-                logId: entryLog._id.toString()
-              },
-              'fcm'
-            ).catch(e => {
-              console.error(`Failed to send FCM notification:`, e);
-              return null;
-            });
-          } else if (admin.pushToken) {
-            return sendPushNotification(
-              admin.pushToken,
-              title,
-              body,
-              {
-                screen: 'Admin',
-                type: 'unregistered_vehicle',
-                licencePlate: detectedPlate,
-                timestamp: timestamp.toISOString(),
-                logId: entryLog._id.toString()
-              },
-              'expo'
-            ).catch(e => {
-              console.error(`Failed to send Expo notification:`, e);
-              return null;
-            });
-          }
-          return Promise.resolve();
-        });
-        
-        await Promise.all(notificationPromises);
-        entryLog.notificationSent = true;
-        await entryLog.save();
-        console.log('Admin notifications sent successfully');
-      } catch (notificationError) {
-        console.error('Error sending notifications:', notificationError);
+          const notificationPromises = admins.map(admin => {
+            if (admin.fcmToken) {
+              return sendPushNotification(
+                admin.fcmToken,
+                notificationTitle,
+                notificationBody,
+                {
+                  screen: 'Admin',
+                  type: notificationType,
+                  licencePlate: detectedPlate,
+                  timestamp: timestamp.toISOString(),
+                  logId: entryLog._id.toString(),
+                  vehicleId: vehicle ? vehicle._id.toString() : null
+                },
+                'fcm'
+              ).catch(e => {
+                console.error(`Failed to send FCM notification:`, e);
+                return null;
+              });
+            } else if (admin.pushToken) {
+              return sendPushNotification(
+                admin.pushToken,
+                notificationTitle,
+                notificationBody,
+                {
+                  screen: 'Admin',
+                  type: notificationType,
+                  licencePlate: detectedPlate,
+                  timestamp: timestamp.toISOString(),
+                  logId: entryLog._id.toString(),
+                  vehicleId: vehicle ? vehicle._id.toString() : null
+                },
+                'expo'
+              ).catch(e => {
+                console.error(`Failed to send Expo notification:`, e);
+                return null;
+              });
+            }
+            return Promise.resolve();
+          });
+          
+          await Promise.all(notificationPromises);
+          entryLog.notificationSent = true;
+          await entryLog.save();
+          console.log('Admin notifications sent successfully');
+        } catch (notificationError) {
+          console.error('Error sending notifications:', notificationError);
+        }
       }
     } else if (vehicle) {
       console.log(`Registered vehicle ${eventType}: ${vehicle.fullName} (${detectedPlate})`);
@@ -1878,6 +1901,36 @@ app.patch('/vehicles/:id', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Update error:', error);
     res.status(500).json({ error: 'Failed to update vehicle' });
+  }
+});
+
+// Toggle notification preference for a vehicle (admin only)
+app.patch('/vehicles/:id/toggle-notification', requireAdmin, async (req, res) => {
+  try {
+    await connectDB();
+    
+    const vehicle = await Vehicle.findById(req.params.id);
+    
+    if (!vehicle) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    // Toggle the notification preference
+    vehicle.notifyOnEntry = !vehicle.notifyOnEntry;
+    vehicle.updatedAt = new Date();
+    await vehicle.save();
+
+    console.log(`Notification ${vehicle.notifyOnEntry ? 'enabled' : 'disabled'} for vehicle ${vehicle.licencePlate}`);
+
+    res.json({ 
+      success: true, 
+      message: `Notifications ${vehicle.notifyOnEntry ? 'enabled' : 'disabled'} for ${vehicle.licencePlate}`,
+      notifyOnEntry: vehicle.notifyOnEntry,
+      vehicle: vehicle
+    });
+  } catch (error) {
+    console.error('Toggle notification error:', error);
+    res.status(500).json({ error: 'Failed to toggle notification preference' });
   }
 });
 
