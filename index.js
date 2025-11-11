@@ -1909,24 +1909,36 @@ app.patch('/vehicles/:id/toggle-notification', requireAdmin, async (req, res) =>
   try {
     await connectDB();
     
-    const vehicle = await Vehicle.findById(req.params.id);
+    // First get the current vehicle to check its notification status
+    const currentVehicle = await Vehicle.findById(req.params.id).lean();
     
-    if (!vehicle) {
+    if (!currentVehicle) {
       return res.status(404).json({ error: 'Vehicle not found' });
     }
 
     // Toggle the notification preference
-    vehicle.notifyOnEntry = !vehicle.notifyOnEntry;
-    vehicle.updatedAt = new Date();
-    await vehicle.save();
+    const newNotifyStatus = !currentVehicle.notifyOnEntry;
+    
+    // Update using findByIdAndUpdate to avoid validation on unchanged fields
+    const updatedVehicle = await Vehicle.findByIdAndUpdate(
+      req.params.id,
+      { 
+        notifyOnEntry: newNotifyStatus,
+        updatedAt: new Date()
+      },
+      { 
+        new: true, // Return the updated document
+        runValidators: false // Don't run validators on unchanged fields
+      }
+    );
 
-    console.log(`Notification ${vehicle.notifyOnEntry ? 'enabled' : 'disabled'} for vehicle ${vehicle.licencePlate}`);
+    console.log(`Notification ${newNotifyStatus ? 'enabled' : 'disabled'} for vehicle ${updatedVehicle.licencePlate}`);
 
     res.json({ 
       success: true, 
-      message: `Notifications ${vehicle.notifyOnEntry ? 'enabled' : 'disabled'} for ${vehicle.licencePlate}`,
-      notifyOnEntry: vehicle.notifyOnEntry,
-      vehicle: vehicle
+      message: `Notifications ${newNotifyStatus ? 'enabled' : 'disabled'} for ${updatedVehicle.licencePlate}`,
+      notifyOnEntry: newNotifyStatus,
+      vehicle: updatedVehicle
     });
   } catch (error) {
     console.error('Toggle notification error:', error);
