@@ -1612,6 +1612,46 @@ app.get('/logs/current-vehicles', requireAdmin, async (req, res) => {
   }
 });
 
+// Delete a vehicle entry log (admin only)
+app.delete('/logs/:logId', requireAdmin, async (req, res) => {
+  try {
+    await connectDB();
+    
+    const { logId } = req.params;
+    
+    // Find and delete the log
+    const deletedLog = await VehicleEntryLog.findByIdAndDelete(logId);
+    
+    if (!deletedLog) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Log entry not found' 
+      });
+    }
+    
+    console.log(`Log deleted: ${deletedLog.licencePlate} - ${deletedLog.eventType} at ${deletedLog.timestamp}`);
+    
+    res.json({
+      success: true,
+      message: 'Log entry deleted successfully',
+      deletedLog: {
+        id: deletedLog._id,
+        licencePlate: deletedLog.licencePlate,
+        eventType: deletedLog.eventType,
+        timestamp: deletedLog.timestamp
+      }
+    });
+    
+  } catch (error) {
+    console.error('Delete log error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to delete log entry',
+      message: error.message
+    });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
