@@ -322,15 +322,23 @@ const sendPushNotification = async (token, title, body, data = {}, platform = 'e
   try {
     // If it's an FCM token, use Firebase Admin SDK
     if (platform === 'fcm' && firebaseAdmin) {
+      // Convert all data values to strings for FCM
+      const stringData = {};
+      for (const [key, value] of Object.entries(data)) {
+        if (value !== null && value !== undefined) {
+          stringData[key] = String(value);
+        }
+      }
+      
       const message = {
         notification: {
           title,
           body,
         },
         data: {
-          ...data,
-          title, // Include title in data for custom handling
-          body,  // Include body in data for custom handling
+          ...stringData,
+          title: String(title), // Include title in data for custom handling
+          body: String(body),   // Include body in data for custom handling
         },
         token: token,
         android: {
@@ -1238,86 +1246,86 @@ app.post('/webhook/plate-detection', upload.single('upload'), async (req, res) =
     console.log('Entry log saved:', entryLog._id);
     
     // Send notification to admins based on vehicle status and preferences
-    if (eventType === 'entry') {
-      let shouldNotify = false;
-      let notificationTitle = '';
-      let notificationBody = '';
-      let notificationType = '';
-      
-      if (!vehicle) {
-        // Unregistered vehicle - always notify
-        shouldNotify = true;
-        notificationTitle = '⚠️ Unregistered Vehicle Detected';
-        notificationBody = `License Plate: ${detectedPlate}\nTime: ${timestamp.toLocaleString()}\nConfidence: ${Math.round(confidence * 100)}%`;
-        notificationType = 'unregistered_vehicle';
-        console.log('Unregistered vehicle detected - sending notifications to admins');
-      } else if (vehicle.notifyOnEntry) {
-        // Registered vehicle with notification enabled
-        shouldNotify = true;
-        notificationTitle = '🔔 Vehicle Entry Alert';
-        notificationBody = `${vehicle.fullName} (${detectedPlate})\n${vehicle.vehicleName}\nTime: ${timestamp.toLocaleString()}`;
-        notificationType = 'registered_vehicle_entry';
-        console.log(`Registered vehicle with notification enabled: ${vehicle.fullName} (${detectedPlate})`);
-      } else {
-        console.log(`Registered vehicle ${eventType}: ${vehicle.fullName} (${detectedPlate}) - no notification`);
-      }
-      
-      if (shouldNotify) {
-        try {
-          const admins = await User.find({ isAdmin: true });
-          console.log(`Found ${admins.length} admins to notify`);
+    let shouldNotify = false;
+    let notificationTitle = '';
+    let notificationBody = '';
+    let notificationType = '';
+    
+    if (!vehicle) {
+      // Unregistered vehicle - always notify for both entry and exit
+      shouldNotify = true;
+      notificationTitle = eventType === 'entry' 
+        ? '⚠️ Unregistered Vehicle Entry' 
+        : '⚠️ Unregistered Vehicle Exit';
+      notificationBody = `License Plate: ${detectedPlate}\nEvent: ${eventType.toUpperCase()}\nTime: ${timestamp.toLocaleString()}\nConfidence: ${Math.round(confidence * 100)}%`;
+      notificationType = `unregistered_vehicle_${eventType}`;
+      console.log(`Unregistered vehicle ${eventType} detected - sending notifications to admins`);
+    } else if (vehicle.notifyOnEntry) {
+      // Registered vehicle with notification enabled - notify for both entry and exit
+      shouldNotify = true;
+      notificationTitle = eventType === 'entry' 
+        ? '🔔 Vehicle Entry Alert' 
+        : '🔔 Vehicle Exit Alert';
+      notificationBody = `${vehicle.fullName} (${detectedPlate})\n${vehicle.vehicleName}\nEvent: ${eventType.toUpperCase()}\nTime: ${timestamp.toLocaleString()}`;
+      notificationType = `registered_vehicle_${eventType}`;
+      console.log(`Registered vehicle with notification enabled: ${vehicle.fullName} (${detectedPlate}) - ${eventType}`);
+    } else {
+      console.log(`Registered vehicle ${eventType}: ${vehicle.fullName} (${detectedPlate}) - no notification`);
+    }
+    
+    if (shouldNotify) {
+      try {
+        const admins = await User.find({ isAdmin: true });
+        console.log(`Found ${admins.length} admins to notify`);
+        
+        const notificationPromises = admins.map(admin => {
+          const notificationData = {
+            screen: 'Admin',
+            type: notificationType,
+            licencePlate: detectedPlate,
+            eventType: eventType,
+            timestamp: timestamp.toISOString(),
+            logId: entryLog._id.toString()
+          };
           
-          const notificationPromises = admins.map(admin => {
-            if (admin.fcmToken) {
-              return sendPushNotification(
-                admin.fcmToken,
-                notificationTitle,
-                notificationBody,
-                {
-                  screen: 'Admin',
-                  type: notificationType,
-                  licencePlate: detectedPlate,
-                  timestamp: timestamp.toISOString(),
-                  logId: entryLog._id.toString(),
-                  vehicleId: vehicle ? vehicle._id.toString() : null
-                },
-                'fcm'
-              ).catch(e => {
-                console.error(`Failed to send FCM notification:`, e);
-                return null;
-              });
-            } else if (admin.pushToken) {
-              return sendPushNotification(
-                admin.pushToken,
-                notificationTitle,
-                notificationBody,
-                {
-                  screen: 'Admin',
-                  type: notificationType,
-                  licencePlate: detectedPlate,
-                  timestamp: timestamp.toISOString(),
-                  logId: entryLog._id.toString(),
-                  vehicleId: vehicle ? vehicle._id.toString() : null
-                },
-                'expo'
-              ).catch(e => {
-                console.error(`Failed to send Expo notification:`, e);
-                return null;
-              });
-            }
-            return Promise.resolve();
-          });
+          // Only add vehicleId if vehicle exists
+          if (vehicle) {
+            notificationData.vehicleId = vehicle._id.toString();
+          }
           
-          await Promise.all(notificationPromises);
-          entryLog.notificationSent = true;
-          await entryLog.save();
-          console.log('Admin notifications sent successfully');
-        } catch (notificationError) {
-          console.error('Error sending notifications:', notificationError);
-        }
+          if (admin.fcmToken) {
+            return sendPushNotification(
+              admin.fcmToken,
+              notificationTitle,
+              notificationBody,
+              notificationData,
+              'fcm'
+            ).catch(e => {
+              console.error(`Failed to send FCM notification:`, e);
+              return null;
+            });
+          } else if (admin.pushToken) {
+            return sendPushNotification(
+              admin.pushToken,
+              notificationTitle,
+              notificationBody,
+              notificationData,
+              'expo'
+            ).catch(e => {
+              console.error(`Failed to send Expo notification:`, e);
+              return null;
+            });
+          }
+          return Promise.resolve();
+        });
+        
+        await Promise.all(notificationPromises);
+        entryLog.notificationSent = true;
+        await entryLog.save();
+        console.log('Admin notifications sent successfully');
+      } catch (notificationError) {
+        console.error('Error sending notifications:', notificationError);
       }
-    } else if (vehicle) {
-      console.log(`Registered vehicle ${eventType}: ${vehicle.fullName} (${detectedPlate})`);
     }
     
     res.json({
